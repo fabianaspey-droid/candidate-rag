@@ -1,0 +1,10 @@
+.venv/
+.env
+data/
+chroma/
+__pycache__/
+*.pyc
+.pytest_cache/
+/jds/
+sample/out/
+sample/chroma/

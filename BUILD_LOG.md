@@ -1,0 +1,736 @@
+# candidate-rag build log
+
+Candidate-matching RAG over a recruitment agency's candidate pool held by sourcing-core (a private
+sourcing engine). For publication, the agency, its client and the client's towns are anonymised
+throughout: "the agency", "the client", "core area" and "wide area".
+sourcing-core is read-only throughout. Real candidate data stays out of git.
+
+sourcing-core location: `C:\Users\Admin\Downloads\sourcing-core`
+candidate-rag location: `C:\Users\Admin\Downloads\candidate-rag`
+
+## Step 0: Inspect the source data (08/10/2026)
+
+### inspect_source.py
+
+Standard library only, takes `--root` pointing at sourcing-core.
+
+**Read-only by design, and why it copies the database first:** the first version opened the
+database directly with `mode=ro` and `PRAGMA query_only=ON`. Tested on a mock sourcing-core in WAL
+mode, that still made SQLite create `core.sqlite-shm` and `core.sqlite-wal` beside the database.
+The database bytes were unchanged, but that is still a write into sourcing-core's folder. Fixed by
+copying the database (and any `-wal` file) to a temp folder that is deleted afterwards, and opening
+the copy. Retested: sourcing-core's folder has the same files with the same bytes before and after,
+and a row that existed only in a pending `-wal` file was still counted.
+
+**Masking failure on the first real run (08/10):** the report was pasted into the build chat with
+real identifiers in it. Two causes, both in inspect_source.py, not in sourcing-core:
+1. Masking went by column name only. `contacts.value` holds LinkedIn URLs, but "value" doesn't look
+   like an identifier column, so two URLs printed in full.
+2. Files mentioning a role were printed if their path matched "config|client|role".
+   `data\apify_probe\role_1.json` matched "role", so the first 150 lines of every raw Apify file in
+   data\apify_probe and data\apify_pool printed: roughly one person's name, LinkedIn URL and
+   headline per file, about a dozen people.
+Fixed: values are now masked when they look like a URL, linkedin.com address, email, phone or
+LinkedIn member id, whatever the column is called, and nothing under a `data` folder is ever
+printed. Retested on a mock with both cases. Lesson carried forward: anything pasted from here on
+prints counts only (inspect_pools.py was written that way).
+
+### What the first real run showed
+
+- One database: `data\core.sqlite` (14.9 MB).
+- people 233. contacts 145, all `apify_linkedin` (LinkedIn URLs). person_sources 134, all
+  `team_page`. positions 844, qualifications 90, source_records 195, firms 23,
+  ch_companies 83,998 (Companies House), schema_meta 1.
+- The labels are in the `matches` table: role_id, person_id, verdict, score, reasons, scored_at.
+  435 rows = 145 per role, for all three roles:
+  - credit-controller: strong 50, possible 12, reject 83
+  - semi-senior: strong 5, possible 21, reject 119
+  - client-manager: strong 1, possible 6, reject 138
+- Roles are data in the client config file in sourcing-core (ROLES and POOL_SEARCHES): criteria
+  only (title families, qualification rules, employer preferences, location town lists).
+  **No job description text is stored anywhere.** The longest text in the database is
+  `matches.reasons` (432 chars) apart from raw Apify JSON.
+- Raw pool files: `data\apify_pool\` credit-controller pages 1-4, semi-senior pages 1-3,
+  client-manager page 1 (143 lines, so probably the refused run). `data\apify_probe\` role_1-4.
+- `data\exports\shortlist.html` exists; the matches table is the label source, not this file.
+
+### Claims in the build guide that the database does not support
+
+1. "Around 68 credit controllers, and 86 people for the semi-senior role." The database has no
+   per-role pool: matches scores the same 145 people against every role. The per-role pool can
+   only be rebuilt from the Apify files. Pending inspect_pools.py.
+2. "86 including the firm-website channel." It is not yet known whether team-page people were
+   scored at all (145 scored people = 145 LinkedIn contacts, which suggests not). Pending.
+3. Credit-controller strong = 50 is the figure from the first full pull, before the 23/09
+   employer downgrade (consumer and finance-house collections to possible) was proposed. Either
+   the downgrade was never applied or matches were not rescored after it. Pending, to be checked
+   from the data before proposing a cause.
+
+### Open decisions
+
+- **Retrieval scope (pushback on the guide's Step 4 role-pool filter):** because sourcing-core
+  scores everyone against every role, filtering retrieval to "the role pool" would hand retrieval
+  the answer. Proposed: search the whole scored pool for every role, with hard filters on
+  location and qualification only. Decide after inspect_pools.py.
+- **client-manager:** no pool of its own (fetch refused), 1 strong. Likely out of scope for the
+  evaluation, since recall cannot be measured on one strong candidate. Decide after
+  inspect_pools.py.
+- **Job description text:** to be saved as plain text in `jds\` (credit-controller.txt,
+  semi-senior.txt) from the original ads.
+
+### inspect_pools.py (second pass, counts only)
+
+Written to answer the three pending claims: people by origin; who matches covers and whether
+anyone was added after scoring; per-role pools rebuilt from the Apify files with their verdicts;
+the credit-controller downgrade against stored verdicts; and how much profile material exists per
+origin. Tested on a mock with the real schema: no names, URLs or firm addresses in the output,
+and the mock sourcing-core folder byte-identical afterwards.
+
+### What inspect_pools.py showed on the real database (08/10)
+
+- **233 people, two separate groups, no overlap:** 145 LinkedIn people (person_id 1-145) and
+  88 team-page people (person_id 146-233).
+- **matches covers the 145 LinkedIn people only,** each scored against all three roles in a single
+  run at 2026-09-23T16:54:01Z. **The 88 team-page people were never scored:** all 88 were first seen
+  after that run. shortlist.html is the export of that same run (modified 17:54 local = 16:54Z).
+- **Per-role pools rebuilt from the Apify files** (every item matched to a person, none unmatched):
+  - credit-controller pool: 68 people (pages 1-3; page 4 returned 0 items). As credit-controller:
+    strong 50, possible 11, reject 7.
+  - semi-senior pool: 56 people (pages 1-3). As semi-senior: strong 5, possible 20, reject 31.
+  - client-manager pool: 0 people (page 1 returned 0 items).
+  - The four probe files hold 10 people each; 21 of the 145 appear only in a probe.
+  - Every rules-strong candidate for credit-controller (50) and semi-senior (5) is in that role's
+    own pool. client-manager's 1 strong and 6 possible all came from other pools or probes.
+- **Credit-controller employer downgrade IS applied:** the 6 people whose current employer matches
+  the pattern are all possible, all 6 with reasons citing it, and 0 of the 50 strong match it.
+- **Profile material:** LinkedIn people have a headline and location (145/145), a median of 5
+  positions and qualification rows for 41. Team-page people have one position each, a location
+  for only 5 of 88, and qualification rows for 25.
+- Qualifications are coded (AAT_QUALIFIED, ACA, ACCA, CICM, CTA and so on) with a status of held,
+  likely_held, studying, part_qualified or finalist, and a basis (team_page, education, headline,
+  name, about, certification).
+
+### The pending claims, resolved against the database
+
+1. "Around 68 credit controllers": **confirmed** as the credit-controller LinkedIn pool (68).
+2. "86 people for the semi-senior role including the firm-website channel": **failed.** The
+   semi-senior LinkedIn pool is 56, and the firm-website (team-page) people were never scored for
+   any role, so none of them has a sourcing-core label.
+3. My own claim that strong = 50 predated the 23/09 credit-controller downgrade: **failed.** The
+   downgrade is in the stored verdicts; 50 strong is after it.
+
+### What this means for the evaluation (proposed, awaiting Fabian's decision)
+
+- **Search all 145 scored people for every role, not the role's pool.** Inside the
+  credit-controller pool, 50 of 68 are rules-strong, so a random 20 from the pool would include
+  about 15 strong candidates and retrieval would have nothing to prove. Across all 145, a random 20
+  would include about 7 of the 50 for credit-controller and under 1 of the 5 for semi-senior.
+- **client-manager out of scope for the evaluation:** no pool of its own and 1 rules-strong
+  candidate, so recall can't be measured.
+- **The 88 team-page people left out of the evaluation index:** no sourcing-core labels to compare
+  against and 83 of 88 have no location. They can come back later as "people the rules never saw".
+- **Credit-controller rules are loose:** 50 of 68 strong. Recall at 20 against 50 rules-strong is
+  capped at 20 of 50, so for this role the useful measures are how many of the top 20 are strong
+  (by hand labels) and false positives. This is also where re-ranking has the most to add: the
+  advert asks for partner-facing, professional-services credit control, which the title rule can't
+  see.
+
+### Job descriptions
+
+No job description text is stored in sourcing-core or in shortlist.html (checked 08/10: the export
+holds role titles and counts only). The full adverts were found in the 23/09 sourcing-core build
+chat, where Fabian pasted all three, and saved as `jds\credit-controller.txt`, `jds\semi-senior.txt`
+and `jds\client-manager.txt`. Text is as pasted, apart from the leading "1./2./3. About the job"
+numbering and two line breaks lost in pasting in the credit-controller ad ("Harborough.As" and
+"The RoleThis").
+
+**Known issue for Step 4:** the adverts are 344 (credit-controller), 401 (semi-senior) and 433
+(client-manager) words. The embedding model reads roughly the first 256 word pieces (about 190
+words) and silently drops the rest, so embedding the whole advert as the query would lose most of
+"What we're looking for". To be decided at Step 4.
+
+### Decisions (Fabian, 08/10, "Yes for all 3")
+
+1. Retrieval searches all 145 scored LinkedIn people for every role. No role-pool filter.
+2. client-manager is out of scope for the evaluation (no pool of its own, 1 rules-strong).
+   `jds\client-manager.txt` is kept but not evaluated.
+3. The 88 team-page people are left out of the evaluation index (never scored, 83 of 88 with no
+   location).
+
+Roles in scope for the evaluation: **credit-controller** and **semi-senior**.
+
+jds files moved into `candidate-rag\jds\` and BUILD_LOG.md replaced on Fabian's machine, 08/10 14:55.
+
+**Step 0 status:** everything identified is done: the database, role definitions, labels, pools and
+job descriptions are located and recorded, and the scope is decided. **Not exercised:** nothing
+has read the jds files yet, and the query-length issue above is open until Step 4.
+
+## Step 1: Set up the project (08/10/2026)
+
+Instructions given: git init, .gitignore before anything else, venv, install chromadb, anthropic,
+python-dotenv and pytest with exact versions in requirements.txt, ANTHROPIC_API_KEY in .env,
+folders src/, tests/, data/, README.md placeholder.
+
+Python 3.12.10, git 2.54.0.windows.1, `git init` done 08/10.
+
+**.gitignore instruction failed as given:** it was a PowerShell here-string (`@' ... '@`) inside an
+indented code block. Pasted, every line carried leading spaces, so PowerShell never saw the
+closing `'@` and sat at the `>>` prompt; nothing was written. Even if it had run, git would not
+have matched "   .venv/" with its leading spaces. Replaced with a one-line `Set-Content` taking an
+array, one pattern per line. No here-strings in instructions from here on.
+
+**Held back: no commit in Step 1.** Anything committed now goes public in Step 8 unless history is
+rewritten. The jds files and this log named the agency and the client, so whether the
+public repository may name the client and its client has to be decided before the first commit.
+
+**Check results (08/10, Fabian's machine):**
+- `git check-ignore -v`: `.env` ignored by `.gitignore:2:.env`; both `data\inspect_*_output.txt`
+  ignored by `.gitignore:3:data/`.
+- `git status --porcelain --untracked-files=all`: .gitignore, BUILD_LOG.md, README.md,
+  inspect_pools.py, inspect_source.py, jds/ (3 files), requirements.txt. Nothing from .env, data/
+  or .venv/.
+- requirements.txt: anthropic==1.12.1, chromadb==1.5.9, pytest==9.1.1, python-dotenv==1.2.4.
+- Imports run from `C:\Users\Admin\Downloads\candidate-rag\.venv`.
+- `.env` holds ANTHROPIC_API_KEY: starts `sk-ant-`, 108 characters. Key not printed.
+
+**Step 1 status:** everything identified is done. **Not exercised:** the API key has only been
+checked for format, not used; no API call has been made. No commit yet (held, see above).
+
+## Step 2: Build the profile documents (08/10/2026)
+
+**Built:** `src\ingest.py`. Reads sourcing-core through a temp copy (same read-only method as
+Step 0) and writes `data\profiles.jsonl`, one record per candidate, id = sourcing-core person_id.
+
+**Scope:** the 145 LinkedIn people sourcing-core scored (decision 3 above).
+
+**Text, in this order:** current role (title, employer, dates); LinkedIn headline; qualifications
+as stated with status (for example "ACCA (studying)", "AAT qualified"); location; "Source:
+LinkedIn"; previous roles (up to 4, most recent first). Capped at 150 words. Previous roles are
+dropped from the end first if a profile is over the cap.
+
+**Deviation from the guide's order:** the guide lists previous roles before qualifications. In
+testing, four long previous roles pushed qualifications to around word 100, near where the
+embedding model stops reading. Previous roles moved to the end so that only old roles are ever
+cut. Names are not in the text: they add nothing to matching.
+
+**Metadata:** person_id, source, location_text; loc_area_core and loc_area_wide (the
+town lists copied from the client config, not imported, so no sourcing-core code runs);
+loc_uk_only; current_title, current_company; qual_codes; has_any_qual, aat_qualified (held or
+likely held), aca_acca_held, aca_acca_in_progress (studying, part-qualified, finalist), cicm;
+client_staff (current employer or headline matches the client's name); n_words; and, for evaluation only,
+eval_label_* and eval_score_* for all three roles.
+
+**Leak check:** reports two numbers. Label words (strong, possible, reject) outside the headline
+must be 0: there they could only come from the template. Label words inside a LinkedIn headline
+("strong communicator") are the person's own wording, reported for checking by eye. Tested by
+planting "Possible hire" in a job title on a mock: caught as a leak.
+
+**Ordering assumption checked by the script:** positions are ordered current first, then by seq
+ascending, assuming seq 0 is the most recent (Apify's order). The check counts people whose current
+role is not their lowest seq.
+
+**Tested on a mock with the real schema (145 LinkedIn + 88 team-page):** 145 records, no
+duplicates, team-page people excluded, client-name headline flagged as client staff, mock
+sourcing-core byte-identical afterwards.
+
+**First real run (08/10 16:31):** 145 records, 0 duplicate ids. Words per text min 24, median
+64, max 116 (cap 150, so the cap never bit). 176 previous roles dropped, all from the four-role
+limit, none from the word cap. Leak check outside the headline: 0. Label word inside a LinkedIn
+headline: 1 (id 4), to be checked by eye. No current role: 10. No qualifications: 104. Location:
+core area 134, wide area 134 (the wide area's extra towns add nobody), "United Kingdom"
+only 8, neither 3. Flags: AAT qualified 14, ACA/ACCA held 1, ACA/ACCA in progress 9, CICM 5.
+Client staff: 4. Eval labels match sourcing-core exactly (credit-controller 50/12/83,
+semi-senior 5/21/119, client-manager 1/6/138). The three sample records read sensibly: current
+role first, qualifications and location before the previous roles.
+
+**Ordering assumption broken for 3 people.** Their current role is not their lowest seq. No cause
+proposed yet. Added `--explain-order`, which prints seq, is_current and dates (no titles or
+employers) for those people, so the stored data can be read first. The effect is limited
+either way: the current role always comes first in the text; only the order of previous roles can
+be affected.
+
+**--explain-order output (08/10 16:33):** ids 68, 70 and 129 each have an entry at seq 0 that is
+not current and has no start or end date ("? - ?"). Their dated positions run newest first as
+assumed (id 68 also has two current roles, seq 1 and seq 4). So the assumption holds for dated
+positions; the flag came from one undated entry stored first. What that entry is was not looked
+at (titles not printed). Fix, independent of what it is: undated previous roles are sorted after
+dated ones (and so are the first to fall off the four-role limit), and the check now compares
+against the lowest DATED seq. Tested on a mock reproducing the pattern: check 0, undated entry
+after the dated roles.
+
+**id 4 headline checked by Fabian:** the label word is "Building Strong Relationships" in the
+person's own headline. Not a leak. It also showed a double full stop where a headline already
+ends in one ("Relationships.."); trailing full stops are now stripped from headlines.
+
+**For Step 4:** the 4 client staff are in the index. They must be excluded by a hard filter
+(client_staff = false) for every role, since the client's own staff must never be put forward.
+
+**Rerun with the fixes (08/10 16:38):** ordering check 0; every other line unchanged (145
+records, 0 duplicates, leak check 0, words 24/64/116, same flags and eval labels).
+
+**Step 2 status:** everything identified is done. **Not exercised:** real word-piece counts
+(measured in Step 3).
+
+## Step 3: Embed and index in ChromaDB (08/10/2026)
+
+**Built:** `src\index.py`. Persistent Chroma in `chroma\`, collection `candidates`, cosine
+distance set through `configuration={"hnsw": {"space": "cosine"}}` (the chromadb 1.x form), Chroma's
+default embedding function (all-MiniLM-L6-v2 through ONNX, local, no cost). Upsert keyed on
+person_id, in batches of 64.
+
+**Decision: eval_* keys are not stored in Chroma.** They stay in data\profiles.jsonl for Step 6
+only. Retrieval physically cannot filter or rank on sourcing-core's verdicts, which is a stronger
+guarantee than "never used in retrieval".
+
+**Checks the script prints:** collection count before and after; ids in Chroma equal ids in
+profiles.jsonl; no eval_* keys stored; distance space read back from Chroma; embedding
+dimensions; real word-piece counts for every profile and every jds file, from a separate,
+untruncated copy of the model's own tokenizer.json; the two sanity queries from the guide, top 5,
+with the sourcing-core label shown beside each result for checking only.
+
+**Confirmed in chromadb 1.5.9's source:** the default model truncates at 256 word pieces including
+[CLS] and [SEP] (`enable_truncation(max_length=256)` in onnx_mini_lm_l6_v2.py).
+
+**Tested here (the model download is blocked from the build workspace, so with a word-hashing
+stand-in for the model, chromadb 1.5.9):** run 1 count 0 to 145; run 2 count 145 to 145; ids
+match; no eval_* keys; space reads back "cosine"; 384 dimensions. The word-piece path was tested
+with a toy tokenizer saved where the real one will be: counts are untruncated (the jds files came
+out over 256).
+
+**Learned in testing:** Chroma rebuilds the embedding function from the collection's saved config
+("default") rather than using the object passed in.
+
+**Real runs (08/10 16:40):** model downloaded (79.3 MB). Run 1: count 0 to 145. Run 2: 145 to
+145, identical output. Ids match, no eval_* keys, cosine, 384 dimensions.
+Profile word pieces: min 43, median 112, max 179; 0 over the 256 window.
+Job descriptions: client-manager 509, credit-controller 445, semi-senior 505 word pieces, so the
+model reads only the first 256 of each (roughly half).
+
+Sanity query "credit controller chasing aged debt": top 5 all credit controllers (four Credit
+Controller, one Senior Credit Controller), distances 0.532-0.548, all rules-strong.
+Sanity query "semi-senior accountant studying ACCA": top 5 all accounts/audit practice staff
+(Audit and Accounts semi senior; Group Accountant Trainee; Accounts and Audit Senior; Semi Senior
+Accountant; Audit & Accounts Senior), all with ACA or ACCA, distances 0.302-0.350; rules: 1 strong,
+4 possible. Right kind of person for both. Why four of these are only "possible" under the rules is
+a Step 6 question, not looked into yet.
+
+**Step 3 status:** everything identified is done. **Not exercised:** anything with the real job
+descriptions as queries (Step 4).
+
+## Step 4: Retrieve (08/10/2026), decisions proposed before building
+
+1. **Query text.** Every advert is 445-509 word pieces against a 256 window, so embedding the
+   whole advert silently drops the second half, which is where the requirements are. Proposed:
+   split each advert into its sections, drop the sections that sell the employer (about the
+   firm, benefits, closing), embed each remaining section as its own query, and combine the
+   rankings with reciprocal rank fusion. Also run the whole advert as-is, as a comparison row.
+2. **Hard filters.** client_staff = false, and location in the role's area or "United Kingdom"
+   only (as sourcing-core does). No hard qualification filter for semi-senior: it would leave
+   about 24 people, so a top 20 would be nearly everyone and prove nothing, and it would drop the
+   no-visible-qualification people Fabian decided on 23/09 to keep as possibles.
+3. **Hand-label sample drawn now and labelled blind, before retrieval output is read.** The guide
+   labels in Step 6, after the shortlists have been seen, which biases the answer key towards
+   what retrieval found.
+
+**Fabian, 08/10 16:42:** "yes to all 3, I'm not too bothered about the specifics, I just want to
+add a RAG build to my CV." Taken as: keep explanations short, keep the checks.
+
+**Built:**
+- `src\make_label_sample.py` writes `data\labels.csv`: 20 per role from the hard-filtered pool,
+  stratified by sourcing-core verdict (credit-controller 7 strong / 6 possible / 7 reject;
+  semi-senior 5 / 8 / 7), shuffled, fixed seed 20261008. Columns: role, id, profile_text,
+  your_label, notes. No sourcing-core verdict in the sheet. Refuses to overwrite an existing
+  labels.csv without --force.
+- `src\retrieve.py`. Three methods per role inside the same hard filters:
+  sections_rrf (main: advert split into sections, employer-selling sections dropped, each kept
+  section a query, reciprocal rank fusion with k = 60), whole_ad (whole advert as one query,
+  truncated by the model), keyword_bm25 (BM25 over profile text, same kept sections as the query).
+  Saves data\retrieval_<role>.json. The check counts rules-strong and rules-possible in each top
+  20, the random expectation, overlap between methods, the rules-strong that sections_rrf missed
+  (when there are 20 or fewer), and the sections_rrf top 20 with titles.
+
+**How the adverts split (real jds files):** credit-controller keeps "The Role", "What you'll be
+doing", "What we're looking for"; drops the intro (employer pitch) and "Why join [the client]".
+Semi-senior keeps "What you'll be doing", "Where this role can take you", "What we're looking
+for", "Nice to have"; drops the intro, "What's on offer" and the "Interested in joining" sign-off.
+Bullets were running together ("practice Liaising directly"); each bullet now gets a full stop.
+
+**Tested on the mock (stand-in embedder):** Chroma's where clause returned exactly the pool the
+Python rule computes (87 and 116 on the mock); client staff excluded; three top 20s per role;
+JSON written; label sheet 40 rows with no verdict columns; second run of the sampler refused.
+
+**Not exercised:** the real index, real word-piece counts per section, and Fabian's labels.
+
+### The answer key: labelled by an LLM, not by hand (08/10 16:48)
+
+Fabian drew the sample (40 rows) and asked the build chat to do the labelling: "I do not have
+time for that. Can you just do the labelling." Done by Claude in the build chat, not by a human.
+
+**What this changes:** the guide's "hand-labelled" no longer applies. RESULTS.md and the README
+must say the answer key came from an LLM reviewer, not a person. It is also partly circular:
+Claude labels, and Claude Haiku re-ranks in Step 5. Different model, but the same family.
+
+**Blindness:** the reviewer had not seen any retrieval output (retrieve.py had not been run). It
+had already seen sourcing-core's verdict for 4 of the 40 in earlier check output (ids 104 and 101,
+credit-controller strong; id 23, semi-senior strong; id 29, semi-senior possible), and nothing for
+the other 36. The sheet itself carried no verdicts.
+
+**Basis:** the adverts, plus Fabian's 23/09 rules: consumer and finance-house collections are
+possible at best; credit manager / credit control manager titles are possible as potentially too
+senior; cautious on unclear qualifications; no false positives over coverage. One-line reason per
+row in the notes column.
+
+**Result:** credit-controller strong 7, possible 7, no 6. Semi-senior strong 8, possible 5, no 7.
+id 42 appears in both samples (no for credit-controller, strong for semi-senior).
+
+Fabian, 08/10 16:52: "I already checked the candidates in the first place for the client demo, so
+they were already hand picked and qualified." sourcing-core's shortlist had his own review before
+the demo; RESULTS.md can say so alongside the LLM-labelled answer key.
+
+### First real run of retrieve.py (08/10 16:52)
+
+- Pool after hard filters: 138 of 145 for both roles (client staff out: 4).
+- **"Chroma returned exactly the same pool: False" for both roles.** Not yet explained.
+- Query word pieces, all inside 256: credit-controller 76 / 139 / 122; semi-senior 84 / 61 / 86 / 31.
+- credit-controller (50 rules-strong in pool, random 20 would hold 7.2): sections_rrf 18 strong +
+  2 possible; whole_ad 18 + 1; keyword_bm25 6 + 4. Overlap with sections_rrf: whole_ad 14,
+  keyword 6. Top 20 is 19 Credit Controllers and 1 Credit control business partner.
+- semi-senior (5 rules-strong, random 0.7): sections_rrf 2 strong + 13 possible; whole_ad 3 + 9;
+  keyword_bm25 4 + 8. **sections_rrf missed ids 22, 26, 42**, all AAT-qualified practice
+  semi-seniors and all labelled strong by the LLM reviewer too, so they are obvious misses. The
+  guide says to fix this here, not leave it to Claude.
+
+No cause proposed for either. Built `src\diagnose_retrieval.py` to query first: (A) the metadata
+filter alone through col.get(where), exact, no vector search, against the Python rule; (B) whether
+the vector search returns the whole filtered pool when asked for it; (C) for ids 22, 26, 42, the
+filter flags and their rank in every section query, the whole advert and the fusion. Tested on the
+mock: runs, all True there.
+
+**Diagnostic on the real index (08/10 16:54):**
+- A. The filter is right: Python rule 138, Chroma get(where) 138, no difference either way, both roles.
+- B. The search returned the whole pool: asked for 138, every query (whole advert and each
+  section) returned 138, none missing. An unfiltered query for all 145 returned 145.
+- So the "False" in retrieve.py did not reproduce. Either the search is not repeatable between
+  runs or something differs between the two scripts. Not yet known; retrieve.py now prints the
+  returned count, the missing and extra ids, and whether the same query gives the same result twice.
+- C. ids 22, 26, 42 are not lost: they rank 17th to 34th per section and 23rd, 25th and 24th after
+  fusion, just outside the top 20, below trainees, a manager and an industry accountant. This is a
+  ranking problem, not a filter or search problem. BM25 caught 4 of the 5 rules-strong where
+  sections_rrf caught 2: the embedding model blurs qualification acronyms and seniority, which
+  keyword matching handles exactly.
+
+**Change: hybrid_rrf added (08/10).** Lexical plus semantic hybrid search: reciprocal rank fusion of
+the sections_rrf ranking and the BM25 ranking, one vote each, k = 60. Added AFTER seeing the
+semi-senior miss, which RESULTS.md must say. Nothing else tuned (section choice, k, weights left as
+they were), because tuning against the same 5 rules-strong people would fit the answer key.
+All four methods are kept and reported. The "missed" list and the printed top 20 now use hybrid_rrf.
+
+### Second real run of retrieve.py (08/10 16:56)
+
+- Pool mismatch reproduced and pinned down: the whole-advert search asked for 138 and returned
+  137; **id 137 missing, identical on repeat**; nothing extra. The diagnostic's run of the same query
+  had returned 138. The filter is right (diagnostic A), so the vector search is dropping a person.
+- chromadb 1.5.9's HNSW config, read in the build workspace: ef_search defaults to 100, below the
+  138 being asked for. HNSW is approximate. **Hypothesis, not yet confirmed:** search depth below
+  the pool size lets the graph search miss a node. id 137 has 13 years as a credit controller, so
+  it matters.
+- credit-controller: sections_rrf 18 rules-strong, whole_ad 18, keyword_bm25 6, **hybrid_rrf 14**.
+  BM25 pulls in a cards governance manager (91), a regional credit lead (102) and a semi-senior
+  accountant (47).
+- semi-senior: sections_rrf 2 of 5, whole_ad 3, keyword_bm25 4, **hybrid_rrf 4 of 5** (misses
+  id 22 only).
+- No single method wins both roles. Hybrid trades some credit-controller precision for
+  semi-senior recall.
+
+**Fix (source, index.py): ef_search = 500**, above the collection size. Set on creation and, for a
+collection that already exists, through col.modify (tested: an existing collection created without
+it is upgraded to 500, and the setting persists after reopening). The check prints ef_search. The
+experiment that confirms or kills the hypothesis: rerun index.py, then retrieve.py, and see whether
+"Chroma returned exactly the same pool" turns True and id 137 comes back.
+
+**Decision for Step 5: re-rank the hybrid_rrf top 20 for both roles.** Chosen after seeing the
+results, which RESULTS.md must say. Reasoning: retrieval's job is recall, because a candidate missed
+at retrieval can't be recovered by re-ranking, while the noise hybrid lets in (91, 102, 47) is
+exactly what the re-ranker's precision rules should remove. One pipeline for both roles: hybrid
+search, then Claude re-rank.
+
+## Step 5: Re-rank with Claude (08/10/2026)
+
+**Model change from the guide: Claude Haiku 5.5 (`claude-haiku-5-5`), not Haiku 4.5.** Checked on
+platform.claude.com on 08/10: Haiku 5.5 is the current Haiku, $0.10 per million input tokens and
+$0.50 per million output (prompts under 100k tokens); Haiku 4.5 is still listed at $1 and $5. Ten
+times cheaper and newer. Haiku 4.5 stays available through `--model`.
+
+**Built:** `src\rerank.py`. One call per role: the full advert (no 256 limit for Claude) and only
+the 20 hybrid_rrf candidates. The system prompt carries the sourcing-core rules: no false positives
+over coverage; cautious on qualifications; right title without a visible qualification is possible;
+consumer and finance-house collections, and credit manager titles, possible at most for
+credit-controller. Asks for JSON only: id, score 0-100, tier, reasoning, evidence quote.
+
+**Guards:** reply must parse with the expected shape, or nothing is written for that role (the raw
+reply is kept in data\rerank_raw_<role>.txt to look at); ids not in the retrieved set dropped;
+duplicates dropped; malformed tier or score dropped; evidence checked against that candidate's own
+text (only whitespace, case and curly quotes normalised; at least 15 characters); strong on an
+unverified quote is downgraded to possible and flagged; retrieved candidates missing from the reply
+logged. Output data\rerank_<role>.json with usage, real cost and the guard log.
+
+**Cost control:** without --spend it is a dry run: input tokens counted with the free
+count_tokens endpoint, output assumed at about 120 tokens per candidate and capped by
+max_tokens = 8000 (any thinking counts as output). With --spend, real tokens and cost come from the
+API response's usage.
+
+**Tests: `tests\test_guards.py`, 9 tests, all passing in the build workspace** (anthropic 1.12.1,
+pytest 9.1.1): verbatim evidence, normalisation limited to whitespace/case/quote marks, short quotes
+unverified, unretrieved id dropped, strong-on-unverified downgraded, duplicate and missing logged,
+malformed tier/score dropped, unparseable reply raises (so nothing is written), fenced JSON parses.
+
+**Estimate before any spend (mock profiles, 4 characters per token):** about 3,000-4,000 input
+tokens per role; worst case at the output cap about $0.004 per role, under 1 US cent for both. Based
+on the mock, which predates the real profiles; the dry run on Fabian's machine replaces it with
+counted figures.
+
+**Not exercised:** any real API call; the ef_search fix on the real index.
+
+### Real runs (08/10 17:15)
+
+**ef_search fix confirmed.** index.py: 145 to 145, ef_search 500. retrieve.py: "Chroma returned
+exactly the same pool: True" for both roles; asked for 138, returned 138, missing none, identical
+on repeat. id 137 is back. The hypothesis (search depth below the pool size) held. Retrieval counts
+are otherwise unchanged from 16:56.
+
+**Tests:** 9 passed on Fabian's machine.
+
+**Dry run:** input tokens counted by the API: credit-controller 5,966, semi-senior 6,124 (about
+double the mock estimate, which used shorter fake profiles plus a character-based guess). Worst
+case at the cap $0.0092 for both.
+
+**Real run (--spend), claude-haiku-5-5:**
+- credit-controller: 5,966 in, 6,006 out, $0.0036, 23.5 s, end_turn. 20 returned, 20 kept.
+  Strong 2 (ids 2 and 103), possible 16, reject 2. No guard drops; 1 unverified quote (id 87, not
+  strong, so no downgrade). Evidence verified 19 of 20.
+- semi-senior: 6,124 in, 6,737 out, $0.0040, 26.0 s, end_turn. 20 returned, 20 kept. Strong 5
+  (42, 27, 59, 45, 57), possible 14, reject 1. 1 unverified quote (id 23, not strong). Evidence
+  verified 19 of 20.
+- **Total $0.0076.** Output was about double the assumed 3,000 per role: the model's own reasoning
+  counts as output. Still under the cap.
+- Observations, not yet explained: Claude was far stricter than the rules on credit-controller
+  (2 strong against 14 rules-strong in the same 20); id 59 (Tax and Accounts Consultant) is
+  Claude-strong for semi-senior but rules-reject.
+
+**Step 5 status:** everything identified is done: output parses, every id from the retrieved set,
+every quote checked (2 unverified, flagged, neither strong), cost logged. **Not exercised:** the
+guide's "read one shortlist yourself": Fabian has not read data\rerank_*.json.
+
+## Step 6: Evaluate (08/10/2026)
+
+**Built:** `src\evaluate.py`, no API calls. Per role: recall at 20 against the answer key for all
+four retrieval methods and a random 20; answer-key "no" let in; the rules' strong found; Claude's
+strong tier judged against the answer key (precision, false positives, and how many fall outside
+the labelled sample and can't be judged); answer-key strong that reached Claude and whether Claude
+kept them strong; both directions of rules-versus-pipeline disagreement with the reason (not
+retrieved, Claude possible, Claude reject); run 2 comparison if present; cost. Also rules versus
+answer key across the 40. Writes RESULTS.md with the caveats stated at the top (LLM-labelled answer
+key, circularity, hybrid added and chosen after seeing results, small samples). Counts only.
+
+`rerank.py` gained `--run N` so a second run writes rerank_<role>_run2.json beside run 1.
+
+**Tested on the mock** (random labels and random re-rank tiers): all tables produced, run 2 section
+appears when the file exists and is skipped when it doesn't.
+
+**Not exercised:** the real data.
+
+### Real results with prompt v1 (08/10 17:19)
+
+Re-rank run 2: credit-controller $0.0037 (strong 2, 103, 89), semi-senior $0.0032 (strong 27, 42, 57,
+59, 45; evidence 20 of 20). Total $0.0069. Runs 1 and 2 together: $0.0145.
+
+**Retrieval (recall at 20 against the answer key):**
+- credit-controller (7 key-strong; random 20 would find 1.0): sections_rrf 5, whole_ad 5,
+  keyword_bm25 3, hybrid_rrf 5. Missed by hybrid: 106, 116 (both Credit Controllers). No method let in
+  an answer-key "no".
+- semi-senior (8 key-strong; random 1.2): sections_rrf 3, whole_ad 4, keyword_bm25 5,
+  **hybrid_rrf 6**. Missed by hybrid: 22, 46.
+
+**Re-ranking, prompt v1:**
+- semi-senior: Claude strong 5; 3 in the answer key, **all 3 agreed, 0 false positives**; 2 not judged
+  (45, 59). Of the 6 key-strong that reached Claude, it kept 3 strong (23, 26, 29 went to possible).
+  Claude found id 27 (Accounts Senior; AAT qualified, studying ACA and CTA) strong where the rules said
+  possible and the answer key says strong. Run 2: same strong set; 1 tier change of 20; mean score
+  change 5.2.
+- credit-controller: Claude strong 2 (ids 2 and 103), neither in the answer key, so precision can't be
+  judged. **Of the 5 key-strong that reached Claude, it kept 0 strong** (3, 7, 89, 101, 104 all
+  possible). Run 2: 3 strong (89 added); 1 tier change; mean score change 3.0.
+
+**Failed claim, named:** I wrote that rerank.py's system prompt "carries the sourcing-core rules". It
+did not, for credit-controller. sourcing-core's rule (the client config) is employers "preferred:
+practice, law_firm; accepted: industry", with points for preferred. The v1 prompt said professional
+services was "the best fit" and never said an industry credit controller could be strong, so Claude
+treated a preference as a requirement and marked ordinary B2B credit controllers possible. A prompt
+that misstated the rule, so fixed at the source rather than tuned.
+
+**Fix: prompt v2.** States that the advert asks for credit control experience; a current or recent
+B2B credit controller can be strong in any industry; professional services is a preference that
+should score highest, not a requirement for strong. Collections and manager rules unchanged.
+Semi-senior rules unchanged. PROMPT_VERSION recorded in each rerank output. Guard tests still
+9 passed.
+
+**Also observed:** the answer key tracks the rules closely. credit-controller: 19 of 20 identical
+(strong to strong 7, possible to possible 6, reject to no 6; one reject to possible). Semi-senior:
+3 rules-possible are key-strong; the rest identical. The LLM reviewer knew the 23/09 rules, so for
+credit-controller "agrees with the answer key" and "agrees with the rules" are nearly the same
+measure. RESULTS.md must say so.
+
+**Plan:** move the v1 outputs (rerank_*, RESULTS.md) to data\archive_prompt_v1, rerun re-ranking
+twice with v2 (about $0.015 based on the two v1 runs), rerun evaluate.
+
+### Results with prompt v2 (08/10 17:23)
+
+Retrieval unchanged (same index, same queries).
+
+- **credit-controller, run 1:** Claude strong 12; 4 inside the answer key, **all 4 agreed, 0 false
+  positives**; 8 not judged. Of the 5 key-strong that reached Claude, **4 kept strong** (v1: 0); 101
+  possible. 1 strong downgraded by the evidence guard (unverified quote), the first time the guard
+  changed an outcome. $0.0038 (6,048 in, 6,368 out). Run 2: 13 strong, 5 of 5 judged agreed, 0 false
+  positives, tier changed for 5 of 20, mean score change 5.8 (max 20), $0.0034.
+- **semi-senior, run 1:** Claude strong 5; 4 in the answer key, all 4 agreed, 0 false positives; 1 not
+  judged. Kept 4 of 6 key-strong strong (26, 29 possible). $0.0037. Run 2: 5 strong (different set),
+  3 of 3 agreed, 0 false positives, tier changed for 2 of 20, mean score change 5.7, $0.0035.
+- **Pipeline versus rules:** credit-controller: Claude strong where the rules said reject: 102
+  (Regional Credit Lead), unlabelled. "Lead" is not caught by the manager rule; a possible false
+  positive that can't be judged. Semi-senior: 27 (rules possible, key strong) and 59 (Tax and Accounts
+  Consultant, rules reject, unlabelled).
+- **Rules strong, pipeline not strong:** credit-controller 39, mostly "not retrieved". The rules
+  call 50 of 138 strong, and a top 20 can't hold 50; this is the retrieval cap, not a miss.
+- **Cost of v2:** $0.0075 + $0.0069. All re-ranking runs today, v1 and v2: about $0.03.
+
+**Step 6 status:** everything identified is done; RESULTS.md written by evaluate.py with prompt v2.
+**Not exercised:** a human reading the shortlists; any answer-key check of the 8 + 1 Claude-strong
+candidates outside the labelled sample.
+
+## Step 7: Agentic search with tool use (08/10/2026)
+
+Fabian: "let's do step 7".
+
+**Built:** `src\agent.py`. Tools through the Messages API: search_candidates (query, n_results 1-20,
+optional filters on aat_qualified, aca_acca_held, aca_acca_in_progress, cicm, has_any_qual),
+get_profile (full text by id), submit_shortlist (ends the run). The hard filters (not client staff;
+role's area or "United Kingdom") are always added by the code: Claude can narrow, never widen; any
+other filter key it sends is ignored. get_profile refuses an id no search has returned. System prompt =
+the Step 5 v2 rules plus instructions to search from several angles (title synonyms, qualifications,
+adjacent roles), read profiles when snippets are not enough, and submit once. Parallel tool calls in
+one turn are handled.
+
+**Limits:** 8 turns; 120,000 cumulative input tokens per role, checked after each turn (so one turn can
+overshoot); 8,000 output tokens per call. If a limit is hit: no shortlist written, trace saved and
+marked aborted.
+
+**Guards:** the Step 5 apply_guards code, with "retrieved" = every id a search returned in this run.
+"Missing from reply" is not counted as a fault for the agent, since it submits what it assessed.
+
+**Trace:** data\agent_trace_<role>.json: every API call (tokens, stop reason) and every tool call
+(turn, query, filters actually applied, n_results, ids returned; get_profile id and any refusal).
+
+**evaluate.py:** adds a Step 7 table per role when agent output exists: searches, candidates seen,
+answer-key strong seen, strong, precision, false positives, cost, the queries the agent chose; side by
+side with Step 5 run 1.
+
+**Tests:** `tests\test_agent.py`, 2 tests with a scripted fake Claude and a fake collection: a full
+session (parallel searches; a client_staff filter from Claude ignored; get_profile refused for an
+unseen id; shortlist with an invented id dropped and an unverified strong downgraded); and the turn
+limit writing no shortlist. 11 of 11 tests pass in the build workspace.
+
+**Cost before the first run:** ceiling per role about $0.046 (120k + 20k input, 8 turns x 8,000 output
+on Haiku 5.5), about $0.09 for both. Expected well under that: the guide's own shape (about 6 turns,
+50-60k input per role) is about $0.006 input, plus output at about the 6,000 per call measured in
+Step 5 if every turn reasons at length, so about 1.5-2 cents per role, 3-4 cents for both. The output
+figure is from Step 5 calls, which predate the agent.
+
+**Not exercised:** a real agent run.
+
+### Real agent run (08/10 17:27)
+
+- **credit-controller:** submitted in 5 turns; 102,970 in, 11,347 out; **$0.0160**; 47.5 s. 7 searches,
+  genuinely different angles: professional-services credit control with partners/billing/WIP; aged
+  debt and chasing; accounts receivable / sales ledger / debtors; first-finance-role accounts
+  assistants; accountancy-firm credit control; CICM credit management; AAT/ACCA-qualified debtor
+  management. 32 get_profile calls, none refused; 63 distinct candidates seen. Submitted 38: strong 17,
+  possible 16, reject 5. Evidence 38 of 38 verified; no guard drops.
+- **semi-senior:** submitted in 5 turns; 79,995 in, 7,140 out; **$0.0116**; 29.6 s. 7 searches,
+  including three that used the qualification filters (aat_qualified 14 results, aca_acca_in_progress
+  8, aca_acca_held 1) and a bookkeeping/software angle. 25 get_profile calls, none refused; 40 seen.
+  Submitted 34: strong 7, possible 18, reject 9. Evidence 34 of 34.
+- **Total $0.0275,** inside the 3-4 cent estimate and far under the $0.09 ceiling. Input ran close to the
+  120k budget on credit-controller (102,970), because every turn resends the whole conversation.
+
+**Against the answer key (evaluate.py):**
+- credit-controller: saw 6 of 7 key-strong (hybrid top 20: 5). Strong 17; 3 in the answer key, all 3
+  agreed, 0 false positives; 14 not judged. Strong overlap with Step 5 run 1: 6.
+- semi-senior: **saw 8 of 8 key-strong** (hybrid top 20: 6), including id 22, which hybrid_rrf and
+  sections_rrf missed. **Failed claim, named:** I told Fabian id 22 was missed by "every fixed retrieval
+  method"; the data only shows hybrid and sections_rrf missing it. Whether whole_ad or BM25 had it was
+  never checked. Strong 7; 5 in the answer key, **all 5 agreed, 0 false positives**. Overlap
+  with Step 5: 5.
+
+**Step 7 status:** everything identified is done: the trace shows different searches, limits never hit,
+guards ran, results compared in RESULTS.md. **Not exercised:** the abort path on real calls (tested
+only with the fake client); a second agent run to measure its run-to-run variation.
+
+## Step 8: Publish to GitHub (08/10/2026)
+
+**Decisions (Fabian, 08/10 17:30):** anonymise ("defo anonymise"); public repository named candidate-rag.
+
+**Anonymisation:**
+- The client's town lists and name pattern moved out of ingest.py into `data\client.json`
+  (git-ignored). ingest.py stops with an error if it is missing.
+- Location fields renamed to neutral names: loc_area_core (was the main office's area) and
+  loc_area_wide (core plus the second office's extra towns). The values are unchanged.
+- The client's name became "client staff" in code and output; retrieve.py drops any "About ..." section
+  rather than naming the firm.
+- The real adverts in `jds\` are git-ignored (`/jds/`, anchored so sample/jds is still published).
+- This log: agency, client and town names replaced, as listed at the top.
+- RESULTS.md no longer lists job titles, only counts.
+
+**Sample mode:** `src\paths.py` switches every script between real data (data\, chroma\, jds\, all
+ignored) and the invented sample (sample\ inputs committed; sample\out\ and sample\chroma\ ignored) with
+`--sample`. `tools\make_sample.py` builds 22 invented candidates with the same build_text() the real
+ingest uses, invented rule verdicts and an invented 20-row answer key; two invented adverts for a
+fictional practice. Tested here end to end (index, retrieve, evaluate) with the stand-in embedder.
+
+**Tests:** `tests\test_index.py` adds the double-run upsert check (in-memory Chroma, tiny stand-in
+embedder) and the Chroma-safe metadata check. tests now use sample\jds. 13 of 13 pass here.
+
+**Leak check:** `tools\check_public.py` scans every file `git add .` would stage for the private terms in
+data\client.json, every real full name and every real employer in sourcing-core (read through a temp
+copy), LinkedIn URLs and email addresses. Exit code 1 on any hit. Must be CLEAN before the push.
+
+**Spend to date:** re-rank v1 $0.0076 + $0.0069, v2 $0.0075 + $0.0069, agent $0.0275: about $0.051.
+
+**Not exercised:** the renamed fields on the real data (needs ingest, index, retrieve, evaluate rerun;
+no API cost), the leak check against the real names and employers, and the push itself.
+
+### Checks before the push (08/10 17:41)
+
+- Real data rebuilt with the neutral field names (ingest, index, retrieve, evaluate): every count
+  identical to the 17:23 and 17:27 runs (core area 134, wide area 134; pools 138; retrieval, re-ranking
+  and agent figures unchanged). The renaming changed names only, not behaviour.
+- Tests: 13 passed on Fabian's machine.
+- Sample mode end to end (index, retrieve, evaluate with --sample): 22 profiles, pools 17 and 20, model
+  reads both invented adverts whole (226 and 231 word pieces). Known cosmetic issues in sample output
+  only: the "random 20" expectation is not capped when the pool is under 20, and invented candidate 3
+  is labelled strong for credit-controller while sitting outside its core area, so the filter
+  correctly excludes them.
+- Leak check: **CLEAN**: 25 files checked against 6 private terms, 465 real employers, 232 real names,
+  LinkedIn URLs and emails.
+- git status lists 25 files: .gitignore, BUILD_LOG.md, README.md, RESULTS.md, inspect_pools.py,
+  inspect_source.py, requirements.txt, sample (4 files), src (10 files), tests (3), tools (2). Nothing
+  from data\, jds\, chroma\, sample\out\ or sample\chroma\.
+
+**Failed claim, named: "Leak check: CLEAN" was wrong.** Straight after it, a plain search of the build
+log found the agency's name three times, written as a Python file name with an underscore (the client
+config file in sourcing-core). check_public.py matched private terms with spaces only, so the
+underscore form passed. Fixed at the source: separators (space, underscore, hyphen, none) are now
+treated alike for private terms; tested on the underscore, hyphen, spaced and run-together forms, and
+on a near miss ("unbalanced") that must not match. The three lines in this log were rewritten. The
+check must be rerun and be CLEAN again before the push.
+
+**Not exercised:** the commit and push.
