@@ -36,17 +36,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from index import CHROMA_DIR, COLLECTION, load_profiles  # noqa: E402
+from index import load_profiles  # noqa: E402
 from rerank import PRICES, SYSTEM as RERANK_RULES, apply_guards, cost_usd  # noqa: E402
-from retrieve import JDS, ROLES as RETRIEVE_ROLES, chroma_where  # noqa: E402
+from retrieve import JDS, ROLES as RETRIEVE_ROLES  # noqa: E402
+from search import FILTER_FLAGS, SNIPPET_CHARS, build_where, embed_rank, open_collection  # noqa: E402
 
 from paths import OUT, PROJECT  # noqa: E402
 MODEL = "claude-haiku-5-5"
 MAX_TURNS = 8
 INPUT_TOKEN_BUDGET = 120_000   # cumulative input tokens per role across all turns
 MAX_TOKENS = 8000              # output cap per call
-SNIPPET_CHARS = 300
-FILTER_FLAGS = ["aat_qualified", "aca_acca_held", "aca_acca_in_progress", "cicm", "has_any_qual"]
 
 TOOLS = [
     {
@@ -124,16 +123,9 @@ class Session:
 
     def search(self, query: str, n_results: int, filters: dict | None = None) -> dict:
         n = max(1, min(int(n_results), 20))
-        clauses = [chroma_where(self.area_flag)]
-        used = {}
-        for k, v in (filters or {}).items():
-            if k in FILTER_FLAGS and isinstance(v, bool):
-                clauses.append({k: {"$eq": v}})
-                used[k] = v
-        where = clauses[0] if len(clauses) == 1 else {"$and": clauses}
-        res = self.col.query(query_texts=[query], n_results=n, where=where, include=["distances"])
+        where, used = build_where(self.area_flag, filters)  # shared with the MCP server (search.py)
         out = []
-        for pid, d in zip(res["ids"][0], res["distances"][0]):
+        for pid, d in embed_rank(self.col, query, where, n):
             if pid not in self.seen:
                 self.seen.append(pid)
             out.append({"id": pid, "distance": round(d, 3), "snippet": self.texts[pid][:SNIPPET_CHARS]})
@@ -222,14 +214,11 @@ def main() -> int:
     if not args.spend:
         return 0
 
-    import chromadb
     from anthropic import Anthropic
-    from chromadb.utils import embedding_functions
     from dotenv import load_dotenv
     load_dotenv(PROJECT / ".env")
     client = Anthropic()
-    col = chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(
-        COLLECTION, embedding_function=embedding_functions.DefaultEmbeddingFunction())
+    col = open_collection()
     texts = {p["id"]: p["text"] for p in load_profiles()}
 
     total = 0.0

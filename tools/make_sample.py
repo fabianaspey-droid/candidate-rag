@@ -21,17 +21,19 @@ WIDE = "Marlow Cross, England, United Kingdom"
 FAR = "Penhallow, Cornwall, United Kingdom"
 UK = "United Kingdom"
 
+# The sample's hiring firm is Ashby Pell (named in sample/jds), so its staff, and only its staff, are client_staff.
+# Fixed 14/10: the first version flagged a different firm's employee and left two Ashby Pell staff unflagged.
 # id, location, current (title, employer, start), previous [(title, employer, start, end)], quals [(code, status)],
 # headline, rules verdict credit-controller, rules verdict semi-senior, client staff
 PEOPLE = [
-    (1, CORE, ("Credit Controller", "Ashby Pell Chartered Accountants", "Mar 2021"), [("Accounts Assistant", "Ferncliffe Foods", "Jan 2018", "Feb 2021")], [], "Credit Controller | Partner billing and WIP queries", "strong", "reject", False),
+    (1, CORE, ("Credit Controller", "Brannock Hale Chartered Accountants", "Mar 2021"), [("Accounts Assistant", "Ferncliffe Foods", "Jan 2018", "Feb 2021")], [], "Credit Controller | Partner billing and WIP queries", "strong", "reject", False),
     (2, CORE, ("Credit Controller", "Brindle & Oakes LLP", "Jun 2022"), [("Credit Control Assistant", "Tamsin Logistics", "May 2019", "Jun 2022")], [("CICM", "studying")], "Credit controller in a law firm", "strong", "reject", False),
     (3, WIDE, ("Senior Credit Controller", "Greywell Engineering", "Feb 2020"), [("Credit Controller", "Orrin Packaging", "Jan 2015", "Jan 2020")], [], "Senior Credit Controller", "strong", "reject", False),
     (4, CORE, ("Credit Controller", "Kestrel Motor Finance", "Apr 2023"), [("Collections Agent", "Northgate Recoveries", "Jan 2020", "Mar 2023")], [], "Collections and arrears specialist", "possible", "reject", False),
     (5, CORE, ("Credit Control Manager", "Larkspur Distribution", "Sep 2016"), [("Credit Controller", "Larkspur Distribution", "May 2010", "Sep 2016")], [("CICM", "held")], "Credit Control Manager, team of six", "possible", "reject", False),
     (6, UK, ("Sales Ledger Clerk", "Pemberton Hardware", "Jan 2024"), [("Customer Service Advisor", "Bellhaven Energy", "Jun 2021", "Dec 2023")], [], "Sales ledger and customer service", "possible", "reject", False),
     (7, CORE, ("Accounts Receivable Assistant", "Quarrington Hotels", "Aug 2022"), [("Receptionist", "Quarrington Hotels", "Mar 2020", "Aug 2022")], [], "Accounts receivable, eager to grow in finance", "possible", "reject", False),
-    (8, CORE, ("Credit Controller", "Ashdown Harrow Accountants", "Jan 2019"), [("Credit Controller", "Velmont Utilities", "Feb 2014", "Dec 2018")], [], "Credit controller at Ashdown Harrow", "strong", "reject", True),
+    (8, CORE, ("Credit Controller", "Ashby Pell Chartered Accountants", "Jan 2019"), [("Credit Controller", "Velmont Utilities", "Feb 2014", "Dec 2018")], [], "Credit controller at Ashby Pell", "strong", "reject", True),
     (9, FAR, ("Credit Controller", "Tregenna Builders Merchants", "Oct 2020"), [], [], "Credit Controller", "reject", "reject", False),
     (10, CORE, ("Semi Senior Accountant", "Mallory Crisp & Co", "Feb 2024"), [("Accounts Junior", "Mallory Crisp & Co", "Sep 2021", "Feb 2024")], [("AAT_QUALIFIED", "held"), ("ACCA", "studying")], "Semi-senior, ACCA student", "reject", "strong", False),
     (11, WIDE, ("Accounts and Audit Semi Senior", "Fenwick Lyle LLP", "May 2023"), [("Audit Junior", "Fenwick Lyle LLP", "Sep 2021", "May 2023")], [("AAT_QUALIFIED", "held")], "Accounts and audit semi-senior", "reject", "strong", False),
@@ -41,7 +43,7 @@ PEOPLE = [
     (15, CORE, ("Assistant Accountant", "Silverdale Plastics", "Jun 2023"), [("Purchase Ledger Clerk", "Silverdale Plastics", "Jan 2021", "Jun 2023")], [("AAT_UNSPEC", "studying")], "Assistant accountant in industry", "reject", "possible", False),
     (16, WIDE, ("Semi Senior Accountant", "Hartwell Bligh Accountants", "Nov 2021"), [], [], "Semi Senior Accountant", "reject", "possible", False),
     (17, CORE, ("Bookkeeper", "Thistle Lane Bookkeeping", "Feb 2019"), [("Office Administrator", "Corrie Estates", "Mar 2015", "Jan 2019")], [("AAT_L3", "held")], "Bookkeeper, Xero and QuickBooks", "reject", "possible", False),
-    (18, CORE, ("Tax Semi Senior", "Ashby Pell Chartered Accountants", "Aug 2023"), [("Tax Trainee", "Ashby Pell Chartered Accountants", "Sep 2021", "Aug 2023")], [("ATT", "held")], "Personal tax semi-senior", "reject", "possible", False),
+    (18, CORE, ("Tax Semi Senior", "Corwen Tilt Accountants", "Aug 2023"), [("Tax Trainee", "Corwen Tilt Accountants", "Sep 2021", "Aug 2023")], [("ATT", "held")], "Personal tax semi-senior", "reject", "possible", False),
     (19, CORE, ("Warehouse Supervisor", "Dunmore Freight", "Apr 2018"), [], [], "Warehouse supervisor", "reject", "reject", False),
     (20, CORE, ("Marketing Executive", "Bramble Digital", "Jan 2022"), [], [], "Digital marketing", "reject", "reject", False),
     (21, UK, ("Accounts Semi Senior", "Coldridge & Moss", "Jul 2023"), [("Accounts Assistant", "Coldridge & Moss", "Jul 2021", "Jul 2023")], [("AAT_QUALIFIED", "likely_held")], "Accounts semi-senior in practice", "reject", "possible", False),

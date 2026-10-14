@@ -29,6 +29,9 @@ from ingest import DEFAULT_ROOT, open_copy  # noqa: E402
 GENERIC = {"self-employed", "self employed", "freelance", "career break", "various", "confidential",
            "travel", "volunteer", "contract", "consultant", "retired", "student", "university"}
 MIN_LEN = 5
+# The domain must start with a letter and end in a letters-only suffix (.com, .co.uk). The first version
+# also matched package version pins such as inspector@2.9.0 (14/10, Part 2 Step 7), which are not emails.
+EMAIL = re.compile(r"[\w.+-]+@[A-Za-z][\w-]*(?:\.[\w-]+)*\.[A-Za-z]{2,}\b")
 
 
 def tracked_files() -> list[Path]:
@@ -70,7 +73,7 @@ def main() -> int:
     patterns += [("real employer", e, re.compile(r"\b" + re.escape(e) + r"\b", re.I)) for e in sorted(employers)]
     patterns += [("real person name", None, re.compile(r"\b" + re.escape(n) + r"\b", re.I)) for n in sorted(names)]
     patterns += [("LinkedIn URL", None, re.compile(r"linkedin\.com/in/", re.I)),
-                 ("email address", None, re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"))]
+                 ("email address", None, EMAIL)]
 
     files = tracked_files()
     hits = 0

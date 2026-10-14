@@ -127,7 +127,7 @@ Python 3.11 or later.
 python -m venv .venv
 # Windows: .venv\Scripts\activate     macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest -q tests                  # 13 tests, no API calls
+python -m pytest -q tests                  # 32 tests, no API calls
 python src/index.py --sample               # first run downloads the embedding model (about 80 MB)
 python src/retrieve.py --sample
 python src/evaluate.py --sample            # writes sample/out/RESULTS.md
@@ -146,13 +146,74 @@ The sample (22 invented candidates at fictional firms, two invented adverts, an 
 built by `tools/make_sample.py`. Its numbers say nothing about real performance; it exists so the
 pipeline can be run end to end.
 
+## MCP server: let any assistant search the pool
+
+`src/mcp_server.py` exposes the search as a [Model Context Protocol](https://modelcontextprotocol.io) server,
+so an MCP-compatible assistant (the Claude desktop app, Claude Code, MCP Inspector) can search the pool
+and read profiles itself. Built on the official MCP Python SDK (mcp 2.3.0, `MCPServer`), stdio transport.
+It makes no paid API calls: search runs on the local model and ChromaDB, and the reasoning is done by
+whichever assistant connects.
+
+| Kind | Name | What it does |
+|---|---|---|
+| Tool | `list_roles` | The roles the pool can be searched against, with a summary and the advert's URI |
+| Tool | `search_candidates` | Hybrid search (semantic + BM25) for one role, inside its hard filters, optional qualification filters, up to 20 results as snippets |
+| Tool | `get_profile` | One candidate's full profile |
+| Resource | `jd://{role}` | The full job advert |
+| Prompt | `shortlist_for_role` | Read the advert, search from several angles, read profiles, shortlist with quoted evidence, using the same cautious rules as the re-ranker |
+
+**How it behaves**
+
+- **Sample by default.** A fresh clone only ever sees the invented sample; real data needs
+  `CANDIDATE_RAG_REAL=1` set explicitly for the server process.
+- **Read-only, measured rather than assumed.** ChromaDB writes to its own files every time it is opened,
+  even just to count records, so the server copies the index to a temporary folder and opens the copy.
+  A fingerprint of the sample and its index before and after a session of calls is identical.
+- **Guards return clear errors**, never an empty list that looks like "no matches": more than 20 results,
+  unknown roles, unknown or non-boolean filters, empty or over-long queries, unknown ids, a missing or
+  empty index. The client's own staff are never returned, and asking for one looks exactly like an
+  unknown id.
+- **Small responses.** Search returns 300-character snippets; full text only through `get_profile`.
+- **Every tool carries the MCP read-only annotation**, so a client can see it changes nothing.
+
+**What building and testing it caught:** the SDK's stdio transport ignored Ctrl+C (the server now
+handles the signal itself); on Windows the temporary index copy was not being deleted on exit until
+Chroma's files were released first; a filter value of `"yes"` was silently accepted as true; and the
+Inspector sent an id as a number, which the first version rejected.
+
+**Checked by:** 19 pytest tests that go through the MCP layer (in-process client, throwaway index,
+stand-in embedder, pinned to the sample); `tools/check_guards.py`, 20 checks against the real server over
+stdio; `tools/inspector_check.py`, 12 checks through the official MCP Inspector (2.9.0) CLI, including
+its strict schema check. In the Claude desktop app, asked for three semi-senior candidates, Claude listed
+the roles first, searched three times (broad, then filtered to AAT-qualified, then to ACA/ACCA
+students), read the full profiles, and returned three candidates who are all strong in the sample's
+answer key, with every quote verbatim.
+
+**Connect it to the Claude desktop app** (Settings > Developer > Edit Config). Use absolute paths to your
+clone and its virtual environment, then quit the app fully and reopen it:
+
+```json
+{
+  "mcpServers": {
+    "candidate-rag": {
+      "command": "C:\\path\\to\\candidate-rag\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\candidate-rag\\src\\mcp_server.py"]
+    }
+  }
+}
+```
+
+If the file already holds settings, add the `mcpServers` block alongside them rather than replacing the
+file. Run `python src/index.py --sample` first so the sample index exists.
+
 ## Layout
 
 ```
-src/        ingest, index, retrieve, rerank, agent, evaluate, paths (real or sample mode)
-tests/      guards, agent loop (scripted fake Claude), double-run upsert
+src/        ingest, index, search, retrieve, rerank, agent, evaluate, mcp_server, paths (real or sample mode)
+tests/      guards, agent loop (scripted fake Claude), double-run upsert, the MCP server through the MCP layer
 sample/     invented profiles, adverts and answer key
-tools/      make_sample.py; check_public.py (scans everything git would publish for real data)
+tools/      make_sample.py; check_public.py (scans everything git would publish for real data);
+            check_guards.py and inspector_check.py (the MCP server's guard and Inspector checks)
 BUILD_LOG.md  the decisions and checks, step by step, as they were made
 RESULTS.md    the real run, counts only
 ```

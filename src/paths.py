@@ -35,4 +35,10 @@ else:
     JDS = PROJECT / "jds"
     RESULTS = PROJECT / "RESULTS.md"
 
-OUT.mkdir(parents=True, exist_ok=True)
+# For guard checks only: point the index somewhere else (e.g. an empty folder) without touching the real one.
+if os.environ.get("CANDIDATE_RAG_CHROMA_DIR"):
+    CHROMA_DIR = Path(os.environ["CANDIDATE_RAG_CHROMA_DIR"])
+
+# The MCP server sets CANDIDATE_RAG_READONLY=1 so that importing this module creates nothing.
+if os.environ.get("CANDIDATE_RAG_READONLY") != "1":
+    OUT.mkdir(parents=True, exist_ok=True)

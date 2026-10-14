@@ -42,8 +42,11 @@ from chromadb.utils import embedding_functions
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from index import COLLECTION, CHROMA_DIR, MODEL_WINDOW, load_profiles, word_piece_counts  # noqa: E402
 from paths import JDS, OUT  # noqa: E402
+# The search functions live in search.py (moved 13/10 so the MCP server, the agent and this script share
+# one copy). Re-exported here under their old names so existing imports keep working.
+from search import (RRF_K, STOPWORDS, bm25, chroma_where, embed_rank, python_filter, rrf,  # noqa: E402,F401
+                    tokens)
 TOP_K = 20
-RRF_K = 60
 
 ROLES = {
     "credit-controller": {"jd": "credit-controller.txt", "eval_key": "credit_controller",
@@ -57,9 +60,7 @@ KEEP_HEADINGS = ["the role", "what you'll be doing", "what we're looking for", "
 DROP_HEADINGS = ["why join", "what's on offer", "interested in joining", "about",
                  "what success looks like"]
 
-STOPWORDS = set("""a an and are as at be been but by can for from has have i if in into is it its
-of on or our so that the their them they this to up we what who will with you your youll yourll
-re ll ve s t""".split())
+
 
 
 # ---------------------------------------------------------------------------- the query side
@@ -100,54 +101,6 @@ def split_advert(text: str) -> tuple[str, list[dict]]:
 def section_queries(title: str, sections: list[dict]) -> list[dict]:
     return [{"heading": s["heading"], "text": f"{title}. {s['heading'].capitalize()}: {s['body']}"}
             for s in sections if s["keep"]]
-
-
-# ---------------------------------------------------------------------------- filters
-def chroma_where(area_flag: str) -> dict:
-    return {"$and": [{"client_staff": {"$eq": False}},
-                     {"$or": [{area_flag: {"$eq": True}}, {"loc_uk_only": {"$eq": True}}]}]}
-
-
-def python_filter(meta: dict, area_flag: str) -> bool:
-    """The same rule as chroma_where, used to check Chroma applied it exactly."""
-    return (not meta["client_staff"]) and (bool(meta[area_flag]) or bool(meta["loc_uk_only"]))
-
-
-# ---------------------------------------------------------------------------- methods
-def embed_rank(col, query: str, where: dict, n: int) -> list[tuple[str, float]]:
-    res = col.query(query_texts=[query], n_results=n, where=where, include=["distances"])
-    return list(zip(res["ids"][0], res["distances"][0]))
-
-
-def rrf(rankings: list[list[str]], k: int = RRF_K) -> list[tuple[str, float]]:
-    scores: Counter = Counter()
-    for ranking in rankings:
-        for rank, pid in enumerate(ranking, 1):
-            scores[pid] += 1.0 / (k + rank)
-    return sorted(scores.items(), key=lambda x: (-x[1], int(x[0])))
-
-
-def tokens(text: str) -> list[str]:
-    return [t for t in re.findall(r"[a-z0-9]+", text.lower().replace("'", "")) if t not in STOPWORDS]
-
-
-def bm25(query: str, docs: dict[str, str], pool: set[str], k1: float = 1.5, b: float = 0.75):
-    toks = {pid: tokens(t) for pid, t in docs.items()}
-    n = len(toks)
-    avgdl = sum(len(t) for t in toks.values()) / n
-    df = Counter(term for t in toks.values() for term in set(t))
-    q = set(tokens(query))
-    out = []
-    for pid in pool:
-        tf = Counter(toks[pid])
-        dl = len(toks[pid])
-        s = 0.0
-        for term in q:
-            if tf[term]:
-                idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
-                s += idf * tf[term] * (k1 + 1) / (tf[term] + k1 * (1 - b + b * dl / avgdl))
-        out.append((pid, s))
-    return sorted(out, key=lambda x: (-x[1], int(x[0])))
 
 
 # ---------------------------------------------------------------------------- main

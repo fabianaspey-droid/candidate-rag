@@ -1,4 +1,5 @@
 anthropic==1.12.1
 chromadb==1.5.9
+mcp[cli]==2.3.0
 pytest==9.1.1
 python-dotenv==1.2.4
