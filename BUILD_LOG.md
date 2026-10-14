@@ -743,3 +743,430 @@ outside: public, README renders, and none of the client, agency or town names ap
 **Step 8 status:** everything identified is done. **Not exercised:** a fresh clone run by someone else
 on another machine (the sample run was done in the working folder, not a clean clone); the Claude
 stages in sample mode.
+
+# Part 2: MCP server (from 13/10/2026)
+
+Build guide: "Candidate RAG MCP server: build guide", 13 Oct 2026. Same working rules as Part 1, plus:
+check the current official MCP Python SDK documentation before any MCP code; the server is read-only;
+real data never in the repo; the public repo only ever runs on the sample.
+
+## Step 0: Inspect the repo (13/10)
+
+Read from the published repo (github.com/fabianaspey-droid/candidate-rag, commit 02de40b), cloned
+and compared file by file with the build workspace: identical apart from line endings in
+sample/labels.csv and the "Published" note at the end of this log, which was not pushed.
+
+**Where each MCP piece's logic lived:**
+- list_roles: `ROLES` in retrieve.py (role id, advert file, location field). No one-line summary
+  exists; to be added in Step 2.
+- search_candidates: semantic search existed only as a method inside the agent loop
+  (`agent.Session.search`); hybrid search existed only inline in `retrieve.main()`, built for whole
+  adverts, not a free-text query. The pieces were plain functions in retrieve.py (`embed_rank`, `bm25`,
+  `rrf`, `chroma_where`).
+- get_profile: `agent.Session.get_profile` (inside the agent loop); text from `index.load_profiles()`.
+- jd://{role}: the advert files under `paths.JDS`, named by `ROLES[role]["jd"]`.
+- Opening the index: the same lines repeated in retrieve.py, agent.py and diagnose_retrieval.py.
+- Sample or real: `paths.py` (`--sample` or `CANDIDATE_RAG_SAMPLE=1` switches DATA, OUT, CHROMA_DIR, JDS).
+
+**Refactor (the guide's "first job"): `src\search.py`.** Moved from retrieve.py unchanged: STOPWORDS,
+chroma_where, python_filter, embed_rank, rrf, tokens, bm25, RRF_K (retrieve.py re-exports them under
+the old names, so diagnose_retrieval.py and other imports still work). Moved from agent.py: FILTER_FLAGS,
+SNIPPET_CHARS, and the filter-building in Session.search as `build_where()`. New: `hybrid_rank()`
+(semantic over the whole filtered pool fused with BM25 over the same pool, one vote each, the same
+fusion as retrieve.py's hybrid_rrf, for a free-text query) and `open_collection()` (raises
+`IndexNotReady` with the command to run if the index folder, the collection or its contents are missing).
+
+**Decision: the Step 7 agent keeps plain semantic search.** Moving it to hybrid would change its
+behaviour and invalidate the published agent results. Hybrid is a separate shared function for the
+MCP server.
+
+**Checks (build workspace, stand-in embedder):** sample retrieval output saved before the refactor and
+compared after: both retrieval_*.json files byte-identical. 13 of 13 tests pass. Every module imports.
+open_collection on a missing folder raises "No index at ... Run: python src/index.py".
+
+**Push-back for later steps, recorded now:**
+1. Rule 5 (real data never leaves the machine) conflicts with Step 6.4 (point Claude at the real
+   data). Through the Claude desktop app, the real candidates' profiles would go to Anthropic as
+   conversation content under a personal account. These are third parties' personal data, sourced
+   for a client demo. Recommendation: skip Step 6.4; the CV claim needs only the sample. If it is done,
+   check the account's privacy setting on using chats to improve models first.
+2. "Read-only" for ChromaDB has to be measured, not assumed: opening a PersistentClient may write to
+   chroma.sqlite3 even for queries (as SQLite did in Part 1, Step 0). Step 4 will hash the index files
+   before and after a session of tool calls.
+
+**Not exercised:** the refactor on Fabian's machine against the real index (real retrieval output to be
+compared before and after).
+
+**Refactor check on Fabian's machine (14/10):**
+- First attempt proved nothing: the venv was not active, so retrieve.py failed on "No module named
+  chromadb", never rewrote its outputs, and the comparison printed IDENTICAL by comparing the old files
+  with themselves. Rerun with the outputs deleted first, so a failed run can't pass.
+- Second attempt: real semi-senior, sample credit-controller and sample semi-senior IDENTICAL; **real
+  credit-controller CHANGED**. 13 tests passed.
+- Queried before proposing a cause: whole_ad and keyword_bm25 identical to the last digit; sections_rrf
+  and hybrid_rrf differ. id 4's sections_rrf score moved by exactly 0.000158 = 1/79 - 1/80, i.e. one
+  rank (80th to 79th) in one section's full-pool ranking, far below the top 20.
+- Three more runs with no code change: run a differs from run b; b equals c. **Same code, different
+  output, so the variation is in the search itself, not the refactor.** Cause not identified.
+- Effect: hybrid_rrf top 20 has exactly the same members as before (order shifted), so the set sent
+  to Claude in Steps 5 and 7 is unaffected. sections_rrf's top 20 swapped one member at the boundary
+  (id 140 before, id 92 now). Recorded as observed behaviour; Step 4 tests to look at repeatability
+  of the MCP search.
+
+**Step 0 status:** everything identified is done. **Not exercised:** the cause of the run-to-run
+variation.
+
+## Step 1: Install the SDK (14/10)
+
+Checked the official SDK before writing any MCP code (rule 2): PyPI lists **mcp 2.3.0** as the latest
+release; the GitHub README (modelcontextprotocol/python-sdk) calls v2 the current stable line, "a
+major rework" with breaking changes, v1.x on its own branch. Read from the installed 2.3.0 package
+itself rather than memory:
+- High-level server: `from mcp.server.mcpserver import MCPServer`. `FastMCP` is gone: importing
+  `mcp.server.fastmcp` in 2.x raises ModuleNotFoundError pointing at the migration guide
+  (py.sdk.modelcontextprotocol.io/v2/migration).
+- Decorators: `@mcp.tool(name, title, description, annotations, ..., structured_output)`,
+  `@mcp.resource(uri, *, name, title, description, mime_type, ...)` with URI templates,
+  `@mcp.prompt(name, title, description)`.
+- `mcp.run(transport="stdio")` (default), synchronous.
+- Requires Python >=3.10. Installed beside chromadb 1.5.9 in the build workspace: pip check "No broken
+  requirements found".
+
+**Decision: mcp[cli]==2.3.0.** The README's advice to pin below 2 is for existing v1 code; this
+project has none. The cli extra provides the `mcp dev` command for the Inspector in Step 5.
+
+**Install on Fabian's machine (14/10 16:01):** mcp 2.3.0 and mcp-types 2.3.0 installed (plus pyjwt,
+cryptography, cffi, pycparser, python-multipart, pywin32, sse-starlette, starlette). pip check: "No
+broken requirements found". `from mcp.server.mcpserver import MCPServer` imports. 13 tests passed.
+Sample retrieval still runs ("exactly the same pool: True" for both roles). requirements.txt now:
+anthropic==1.12.1, chromadb==1.5.9, mcp[cli]==2.3.0, pytest==9.1.1, python-dotenv==1.2.4. The Step 0
+comparison folders (data\pre_refactor, sample\pre_refactor) deleted; the sample one would otherwise
+have been published.
+
+**Step 1 status:** everything identified is done. **Not exercised:** whether the Claude desktop app
+works with a 2.x server (Step 6).
+
+## Step 2: Design the tools (14/10), PROPOSED, awaiting Fabian's agreement
+
+**Data source:** the server defaults to the invented sample. Real data only when the environment
+variable `CANDIDATE_RAG_REAL=1` is set for the server process. Note this is the opposite of the
+command-line scripts, which default to real data and take --sample; for a server anyone can clone and
+connect, sample-by-default is the safe way round.
+
+**Rules that hold for every tool:** read-only; the client's own staff are never returned by any tool,
+including get_profile; errors come back as MCP tool errors with a message saying what to do, never an
+empty result that looks like "no matches"; every tool carries the MCP read-only annotation
+(readOnlyHint) so a client can see it changes nothing.
+
+### Tool: list_roles
+- Parameters: none.
+- Returns: `{"mode": "sample" | "real", "roles": [{"role": str, "title": str, "summary": str,
+  "jd_uri": str}]}`
+- Description: "List the roles this candidate pool can be searched against. Returns each role's id,
+  title, a one-line summary and the URI of its full job description (jd://<role>). Call this first if
+  you don't know the role ids: search_candidates and the shortlist_for_role prompt both need one."
+
+### Tool: search_candidates
+- Parameters: `role` (str, required, one of list_roles), `query` (str, required, plain words),
+  `n_results` (int, 1-20, default 10), `filters` (optional object: aat_qualified, aca_acca_held,
+  aca_acca_in_progress, cicm, has_any_qual, each true/false).
+- Method: hybrid search (search.hybrid_rank): semantic ranking over the role's whole filtered pool
+  fused with BM25 over the same pool.
+- Returns: `{"role", "query", "filters_applied", "pool_size", "results": [{"rank": int, "id": str,
+  "title": str, "employer": str, "location": str, "qualifications": [str], "snippet": str,
+  "score": float}]}`. snippet = first 300 characters of the profile.
+- Description: "Search the candidate pool for one role, by meaning and by keyword together (hybrid
+  search). The role's hard filters are always applied: only candidates in that role's location area,
+  or whose location says just 'United Kingdom', and never the client's own staff. You can narrow
+  further with qualification filters. Returns up to n_results candidates (1 to 20, default 10), best
+  first, each with id, current title, employer, location, qualification codes, the first 300
+  characters of their profile and a relevance score that can only be compared within the same search.
+  Snippets are not full profiles: call get_profile before judging or quoting anyone. Several short
+  searches from different angles (job title synonyms, qualifications, related roles) find more than one
+  long query."
+
+### Tool: get_profile
+- Parameters: `candidate_id` (str, required).
+- Returns: `{"id", "title", "employer", "location", "qualifications": [str], "profile": str}`.
+- Description: "Return one candidate's full profile by id, as given by search_candidates: current role,
+  headline, qualifications as stated, location and previous roles. Read this before recommending a
+  candidate, and quote only text that appears in it. Unknown ids return an error."
+
+### Resource: jd://{role}
+- Plain text, the full job advert for the role. Description: "The full job advert for a role. Read it
+  before searching so your searches reflect what the advert asks for."
+
+### Prompt: shortlist_for_role
+- Arguments: `role` (str), `how_many` (int, default 3).
+- Text: read jd://<role>; search from at least three different angles; read the full profile of every
+  candidate before recommending them; apply the same cautious rules as the Step 5 re-ranker (prompt
+  v2: no false positives over coverage; only stated qualifications count; right title without a
+  visible qualification is possible, not strong; for credit control, consumer or finance-house
+  collections and manager titles are possible at most); give each recommendation an evidence quote
+  copied exactly from that profile; if fewer than how_many are strong, say so rather than padding.
+
+### Decisions in this design (for agreement)
+1. `role` is required on search_candidates, not optional. The location filter and the client-staff
+   exclusion belong to the role; a search without one would either have no location rule or need a
+   second, separate filter that could widen what the agent can see.
+2. Location is not a free parameter: it is set by the role.
+3. More than 20 results is rejected with an error rather than silently cut to 20, so a caller learns
+   the limit.
+4. No rerank_candidates tool: the connected assistant does that reasoning, and leaving it out keeps the
+   server free to run, as the guide suggests.
+
+**Fabian, 14/10 16:05: "I agree with all."** Step 2 design agreed as written above.
+
+## Step 3: Build the server (14/10)
+
+**Built: `src\mcp_server.py`** on mcp 2.3.0: `MCPServer("candidate-rag", instructions=...)`; tools
+list_roles, search_candidates, get_profile (each with ToolAnnotations read_only_hint=True,
+destructive_hint=False, idempotent_hint=True, open_world_hint=False); resource template `jd://{role}`
+(text/plain); prompt shortlist_for_role(role, how_many=3) carrying the Step 5 v2 rules. Returns are
+TypedDicts, so the SDK publishes an output schema and returns structured content. Search uses the
+shared search.hybrid_rank. Profiles and the collection load once, on first use.
+
+**Read from the SDK before writing (rule 2), and tried in a prototype server:** ToolError (in
+mcp.server.mcpserver.exceptions) gives the assistant your message with is_error; any other exception
+is treated as a crash and the assistant sees only "Error executing tool <name>". ResourceNotFoundError
+for a missing resource. The SDK logs to stderr. Client(MCPServer) connects in-process;
+Client(StdioServerParameters) launches the real server as a subprocess over stdio.
+
+**Found and fixed while building:**
+1. **Loose filter values.** The prototype accepted `{"cicm": "yes"}` as true: pydantic coerces
+   loosely by default. Filters now use StrictBool, and unknown filter keys are rejected (extra="forbid").
+2. **paths.py created a folder on import.** `OUT.mkdir(...)` ran whenever paths.py was imported, a write.
+   It now skips that when CANDIDATE_RAG_READONLY=1, which the server sets before importing it.
+3. **Chroma writes on every open, measured.** An in-process session of read-only tool calls changed
+   sample\chroma\chroma.sqlite3 and an HNSW file (length.bin). Repeated: every session changed 2-3
+   files, and a bare PersistentClient open followed only by count() changed 3. This is the risk
+   recorded in Step 0, now confirmed. Fixed at the source, the same way as SQLite in Part 1:
+   `search.open_collection(read_only_copy=True)` copies the index folder to a temporary folder and
+   opens the copy; the copy is removed at exit. The server uses it. Retested: two full sessions, the
+   sample folder and index byte-identical, no temporary copies left behind.
+4. **Ctrl+C did not stop the server.** Two tests of mine were invalid first (feeding /dev/zero; then a
+   bash background job, where bash makes the process ignore SIGINT). Tested properly from Python: no exit
+   within 10 s of SIGINT; it stopped only when stdin closed. Cause read in the SDK: the stdio transport
+   reads stdin through anyio.wrap_file on a worker thread, which the shutdown waits for. Fix: the server
+   handles SIGINT and SIGTERM itself: logs, removes the temporary index copy, os._exit(0) (read-only, so
+   nothing to save). Retested: exits 0.02 s after Ctrl+C with code 0; temporary copy present while
+   running, gone after Ctrl+C; closing stdin (how clients stop a server) exits in 0.42 s, code 0.
+
+**Checks in the build workspace:**
+- In-process: 3 tools (all read_only_hint true), template jd://{role}, prompt shortlist_for_role;
+  list_roles mode "sample" with both roles and titles; search_candidates returns ranked hits (pool 20
+  for semi-senior); a filter (aca_acca_in_progress) narrows the pool to 3; get_profile, resource and
+  prompt return the expected text.
+- Real stdio subprocess (python src/mcp_server.py): handshake negotiated protocol 2026-07-28 with the
+  SDK client and 2025-06-18 when a client asked for that; tools listed; list_roles, get_profile and
+  jd://semi-senior worked over the pipe; stdout carried only protocol messages, logs on stderr.
+- get_profile for an unknown id and for a client-staff id return the same "No candidate with id"
+  error, so the tool never reveals who is client staff.
+- 13 existing tests pass.
+
+**Not exercised:** search_candidates over stdio with the real embedding model (blocked in the build
+workspace; works in-process with a stand-in); the server on Windows; anything with the real data.
+**For Step 4:** an unanticipated failure (such as the embedding model failing to load) currently
+reaches the assistant only as the generic "Error executing tool search_candidates".
+
+**Step 3 on Fabian's machine (14/10 16:16):** 13 tests passed; `python src\mcp_server.py` started
+("starting: mode=sample data=...\sample ... (read-only, stdio)") and waited; Ctrl+C printed
+"stopping (signal 2)" and returned the prompt. **Step 3 status:** everything identified is done.
+**Not exercised:** a search through the server with the real embedding model.
+
+## Step 4: Add the guards (14/10)
+
+Most guards were built into Step 3. Added:
+- **Unanticipated failures say what failed.** Search is wrapped: anything other than a ToolError is
+  logged with its traceback to stderr and returned as "Search failed (<type>: <message>). The embedding
+  model (about 80 MB) downloads on the first search on a machine; check the server log." Seen working
+  in the build workspace, where the model download is blocked.
+- **query** at most 500 characters (schema-level, max_length).
+- **A filter combination with no candidates** returns an error saying to loosen it, not an empty list.
+- **Prompt arguments:** unknown role and how_many outside 1-20 rejected. First version raised
+  ValueError, which reached the client only as "Internal server error" (the SDK withholds plain
+  exception text from prompts). Fixed: MCPError with JSON-RPC code -32602 (invalid params), which
+  carries the message.
+- **CANDIDATE_RAG_CHROMA_DIR** (paths.py): points the index elsewhere, used only so the check can run
+  the server against a missing or empty index without touching the real one.
+
+Read from the SDK: a server launched over stdio gets only a safe list of environment variables
+(on Windows APPDATA, HOMEDRIVE, HOMEPATH, LOCALAPPDATA, PATH, PATHEXT, PROCESSOR_ARCHITECTURE,
+SYSTEMDRIVE, SYSTEMROOT, TEMP, USERNAME, USERPROFILE) merged with any the client adds. So the model
+cache under the user folder is found, and for Step 6 CANDIDATE_RAG_REAL would have to be set in the
+client's config, not in a shell.
+
+**Built: `tools\check_guards.py`.** Launches the real server over stdio and checks, PASS or FAIL: a
+normal search returns 5 ranked results; results are snippets (300 characters at most); 21 and 0
+results rejected; unknown role; unknown filter key; non-boolean filter value; empty query; over-long
+query; made-up id; client-staff id (same error as made-up); a real id returns the full profile; unknown
+role advert; prompt how_many over 20; prompt unknown role; missing index and empty index (servers
+started on temporary folders) say "Run: python src/index.py"; sample folder and index fingerprinted
+before and after every call above, unchanged.
+
+**Build workspace result: 16 of 18 passed.** The 2 failures are the normal search and its snippet
+check, which need the embedding model the workspace cannot download; the failure itself came back as
+the new clear message. 13 existing tests pass.
+
+**Not exercised:** the normal search over stdio with the real model (Fabian's machine).
+
+**check_guards.py on Fabian's machine (14/10 16:22):** the first 17 checks PASSED, including the
+normal search with the real embedding model (pool 20; top: 10 Semi Senior Accountant, 21 Accounts Semi
+Senior, 11 Accounts and Audit Semi Senior) and snippets capped at 300 characters. Then the script
+crashed in its own cleanup: PermissionError [WinError 32], chroma.sqlite3 in the temporary EMPTY test
+index "being used by another process". Windows will not delete an open file; Linux will, which is why
+it passed in the build workspace. The holder was the script's own chromadb client (it made that index
+in-process). The read-only fingerprint check never ran.
+
+**The same question for the server, not yet measured:** the server also deletes a temporary index
+copy on exit, with ignore_cleanup_errors=True, so on Windows it could be failing silently and leaving
+copies in %TEMP%. Changes:
+- search.close_temp_copies(): stops Chroma's cached systems and clears its cache, then deletes the
+  copies, and returns any that could not be removed. The server calls it on Ctrl+C/SIGTERM and when the
+  client closes the connection, and logs a warning naming any copy it could not remove.
+- check_guards.py: the empty test index is made in a separate process, so the script holds nothing
+  open; temporary folders use ignore_cleanup_errors; a 19th check counts the server's temporary copies
+  in the temp folder before and after the run (must be no new ones).
+Build workspace: 17 of 19 (the 2 model searches), new check PASS; 13 tests pass. On Windows the
+19th check is the real test.
+
+**check_guards.py on Fabian's machine, second run (14/10 16:27):** before the run, **2**
+candidate_rag_index_* folders were already in %TEMP%: left by the previous version's servers in the
+16:22 run, so the old cleanup DID fail silently on Windows, as suspected. With close_temp_copies:
+**19 of 19 passed**, including "server deletes its temporary index copies on exit: none left" and
+"read-only: 9 files fingerprinted; changed: none". The 2 leftovers (copies of the invented sample
+index) to be deleted by hand.
+
+**Step 4 status:** everything identified is done.
+
+## Step 5: Test it (14/10)
+
+**Inspector:** `mcp dev` in SDK 2.3.0 runs the server through `uv run`, which this project does not
+use, so the Inspector is launched directly with npx. Version pinned to **2.9.0** (30/09): the newest,
+2.11.0, was published on 14/10, the same day, too new to trust; the newest release at least two weeks
+old is 2.9.0. Needs Node.js >= 22.19. Learned by running it (its README is thin): the command-line
+form is `--cli <command> <args> --method ...` (server command FIRST; a `--catalog` option or a `--`
+separator made it report "No servers found in config file"); `--strict` reports tool-schema
+portability problems; it keeps a catalog in ~/.mcp-inspector; secrets set to memory.
+
+**The Inspector found a real bug:** `get_profile candidate_id=10` was rejected, "Input should be a
+valid string ... input_value=10, input_type=int". The Inspector sends numeric-looking values as
+numbers, and assistants are likely to do the same with ids like "10". Fixed: candidate_id accepts str or
+int and is normalised to text. check_guards.py gained a case for it (20 checks).
+
+**Built: `tools\inspector_check.py`** (12 checks via the Inspector CLI, PASS/FAIL): Node version;
+tools/list lists exactly the 3 agreed tools, all readOnlyHint; --strict exit code 0; resource template;
+prompt and its arguments; list_roles in sample mode; a 5-result search; 21 results rejected;
+get_profile with a numeric id; made-up id rejected; advert read; prompt renders. Build workspace:
+11 of 12 (the model search).
+
+**Built: automated tests through the MCP layer.** `tests\conftest.py` pins every test to the invented
+sample (removes CANDIDATE_RAG_REAL, sets CANDIDATE_RAG_SAMPLE and CANDIDATE_RAG_READONLY) and points
+the index at a throwaway folder, so no test can read the real data. `tests\test_mcp_server.py` (19 tests
+counting the parametrised guards) calls everything through the SDK's Client connected to the server
+in-process; the throwaway index uses a deterministic stand-in embedder, so they test the MCP layer and
+guards, not search quality. Covers: exactly the agreed tools/resource/prompt, all read-only, with
+descriptions; sample by default; ranked snippets inside the hard filters with the right pool size; a
+qualification filter narrowing the pool; client staff never returned by search or get_profile; text and
+numeric ids identical; the advert resource; the prompt's rules; 8 bad tool inputs; bad resource and
+prompt arguments; missing index; sample folder and index unchanged by a session.
+
+**Build workspace: 32 passed** (13 original + 19). sample\ and data\ unchanged by the run; no temporary
+folders left. **The tests bite:** removing the client-staff check from get_profile made exactly
+test_client_staff_are_never_returned fail (1 failed, 31 passed); restored, 32 passed.
+
+**Not exercised:** all three on Fabian's machine; the Inspector's browser interface (the CLI covers the
+same calls).
+
+**Step 5 on Fabian's machine (14/10 16:38-16:41):** pytest **32 passed**; check_guards.py **20 of 20**
+(numeric id accepted; no temporary copies left); Node.js was not installed (the Inspector check stopped
+with "Node.js not found"); installed Node v24.20.0; inspector_check.py **12 of 12** (5-result search
+with the real model: 10 Semi Senior Accountant, 21 Accounts Semi Senior, 11 Accounts and Audit Semi
+Senior, 16 Semi Senior Accountant, 13 Accounts Senior; --strict exit code 0).
+
+**Step 5 status:** everything identified is done. **Not exercised:** the Inspector's browser interface.
+
+## Step 6: Connect it to Claude (14/10)
+
+From the official guide (modelcontextprotocol.io, "Connect to local MCP servers", fetched 14/10): open
+the config through Claude desktop Settings > Developer > Edit Config (Windows file:
+%APPDATA%\Claude\claude_desktop_config.json); `mcpServers` entries take `command`, `args`, optional
+`env`; paths must be absolute; quit and restart the app fully; tools appear under the "+" (Add files,
+connectors and more) > Connectors > Manage connectors; logs in %APPDATA%\Claude\logs (mcp.log, and
+mcp-server-<name>.log holding the server's stderr).
+
+Config used: command = the project's venv python (absolute), args = src\mcp_server.py (absolute), no
+env, so the server runs on the sample (Step 2 decision).
+
+**Desktop config:** Fabian's claude_desktop_config.json already held the app's own preferences, so
+it was merged, not replaced: the existing JSON parsed, `mcpServers.candidate-rag` added, and checked
+that every original setting was identical. Pasted into the file the app's Edit Config opened (the
+install looks like the Microsoft Store package, whose settings path can differ from %APPDATA%).
+The three tools showed as needing approval; set to Always allow (all three read-only, on the sample).
+
+**First run in the Claude desktop app (14/10 16:55), sample, prompt "Use the candidate-rag tools to
+shortlist the 3 best candidates for the semi-senior role, with an evidence quote from each profile":**
+- Picks: 10 (Semi Senior Accountant), 21 (Accounts Semi Senior), 11 (Accounts and Audit Semi Senior).
+  **All three are strong in the invented answer key; no false positives.** Left out 13 (key strong) as
+  an Accounts Senior since 2022 for whom the role would be a step down: a defensible call.
+- **All 5 quotes verified word for word** against sample/profiles.jsonl, and the career facts it gave
+  (dates, promotions, previous roles) are right. It flagged its own limits correctly: "likely held" AAT
+  for 21, location only "United Kingdom" for 21, and that no profile mentions VAT or personal tax work.
+- Tool calls not yet checked (which tools, in what order): to be read from the chat.
+
+**Bug found by the run, in the invented sample (not the server): client staff flagged on the wrong
+people.** The sample adverts name the fictional hiring firm as Ashby Pell, but make_sample.py
+flagged id 8 (at a different firm) as client_staff and left ids 1 and 18, both at Ashby Pell,
+unflagged, so Claude listed candidate 18 as a close call. The server's rule worked as built; the
+data was wrong. Fixed in tools\make_sample.py: id 8 now works at Ashby Pell (the only client staff);
+ids 1 and 18 moved to invented firms; labels unchanged. Regenerated; 32 tests pass; guards 18 of 20 in
+the build workspace (the 2 model searches).
+
+**Second desktop run (14/10 17:01), after the sample fix and a full restart of the app:** picks 10, 11,
+21, all strong in the answer key, no false positives; 13 left out again as a step down; 18 now shown at
+Corwen Tilt and the Ashby Pell employee never appears; Claude noticed the "sample" mode and pool of 20
+and said so. All 3 quotes verified verbatim. Tool order (Fabian, from the chat): list_roles, then
+search_candidates, then get_profile.
+
+**Server log** (found at %LOCALAPPDATA%\Claude\logs\mcp-server-candidate-rag.log, NOT the %APPDATA%
+path the official guide gives): both runs made three searches for semi-senior, one broad (n=15, pool
+20) and two with qualification filters Claude chose itself (aat_qualified: pool 3; aca_acca_in_progress:
+pool 3), so it searched from more than one angle. Pool sizes match the sample. The app starts the server
+twice on each launch, a second apart (harmless). On quitting the app at 17:00:16 the server logged
+"stopped (client closed the connection)"; the one temporary index copy in %TEMP% afterwards was created
+17:01:22, one second before the live server's first search, so it belongs to the running server and the
+closed session cleaned up.
+
+**Step 6 status:** everything identified is done on the sample. **Step 6.4 (real data through the
+desktop app) not done**, on the recommendation recorded in Step 0: it would send real candidates'
+profiles to Anthropic as conversation content under a personal account, and the CV claim needs only the
+sample. Fabian, 17:15: "let's get this finished". No screenshot taken.
+
+## Step 7: Publish (14/10)
+
+README: new section "MCP server: let any assistant search the pool" (what it exposes; sample by
+default; read-only by index copy; guards; what building it caught; the three check suites; the desktop
+run; how to connect, with placeholder paths); test count 13 -> 32; layout lines updated. Then the
+leak check, git status, commit, push.
+
+**First leak check (17:20): 2 hits, both false.** Pytest 32 passed. check_public.py flagged "email
+address" at tools/inspector_check.py lines 4 and 23: both are the Inspector's version pin,
+`@modelcontextprotocol/inspector@2.9.0`, which the email pattern matched (a name, an at sign, then numbers and dots).
+Not real data. Fixed in the checker rather than by allow-listing the file: the domain must now start
+with a letter and end in a letters-only suffix. Checked against four real-shaped addresses (all still
+caught, including a hyphenated .co.uk) and four version pins (none caught). git status listed nothing
+from data/, jds/, chroma/, sample/out/ or sample/chroma/.
+
+**Second leak check: 1 hit, my own wording.** The log entry above described the false match as
+a made-up example address (a word, an at sign, then words and dots), which is itself shaped like an email address. Reworded; the rescan was CLEAN.
+
+**Published (14/10, 17:24): commit 4e20187 on main**, 15 files changed. Checked from outside on a fresh
+clone of github.com/fabianaspey-droid/candidate-rag: 31 files, none from data/, jds/, chroma/,
+sample/out/ or sample/chroma/, no .env, no client or agency name, no LinkedIn URL, no email address;
+installed from requirements.txt on Linux (Python 3.13) and ran the tests: 32 passed, and the run left
+no new files in the clone.
+
+**Part 2 status:** everything identified is done. Not exercised: the real pool through the desktop app
+(Step 6.4, skipped on purpose), the Inspector's browser UI (only its CLI was used), check_guards.py and
+inspector_check.py on the fresh clone (they need the real embedding model download and Node), and the
+server on macOS or Linux through a desktop client.
