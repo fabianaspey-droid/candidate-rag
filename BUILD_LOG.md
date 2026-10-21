@@ -1650,3 +1650,44 @@ given to an interviewer directly.
 
 **Step 4 status:** everything identified is done. Not exercised: a full delete and recreate with the fixed
 helper (delete was run once, before the drain fix); the spend after a day; the CloudWatch logs (Step 5).
+
+## Step 5: CloudWatch logs (21/10)
+
+Fabian: "I want to finish everything today."
+
+Definition of done for this step: the logs are kept 14 days, not forever (the default, a slow silent cost);
+the server's lines reach CloudWatch; what someone searches for never does; one saved Logs Insights query.
+
+**New `logs` command in aws_deploy.py.** Sets 14-day retention on the service's log group and on any left by
+an earlier service of the same name (the first attempt's group, ending -be17, is still there). Then a marker
+check: a made-up word ("canary" plus 10 random hex characters) is sent in four calls to the live URL: a normal
+search, a query over the 500-character limit (a validation error, which repeats the input in its message), an
+unknown role and an unknown candidate id (our refusals name what was sent, so the caller can correct it). It
+waits until the normal search's own log line ("search_candidates role=semi-senior n=5 ...") has reached
+CloudWatch, which proves the logs arrive at all, then searches the group for the marker: any hit is a FAIL and
+the lines are printed. Last, it saves the Logs Insights query "candidate-rag-mcp/activity" (every line except
+the load balancer's health checks, newest first) and runs it once over the last hour.
+
+**What the check found before going near AWS (tested against a local server, with a stand-in for the AWS CLI
+that reads the server's real log file):** 2 lines contained the marker. The SDK logs every tool refusal at INFO
+with its message: `Tool 'search_candidates' failed: "... Unknown role 'canary...'"` and `Tool 'get_profile'
+failed: "... No candidate with id 'canary...'"`. The search text itself was not in either, and the over-long
+query was logged as field names only (the SDK does that for validation errors: `rejected arguments:
+['query']`). But a caller can type anything into role or candidate id, so the claim "nothing the caller sends
+is logged" was false. A failed resource read logs the URI the caller asked for, the same way.
+
+**Fix at the source:** a logging filter on the SDK's `mcp.server.mcpserver.server` logger in mcp_server.py.
+Refusals are still logged as events ("Tool 'get_profile' refused the call (its message is not logged)";
+"Resource read refused (URI and message not logged)"); the caller still gets the full message. New test
+`test_refused_calls_never_put_the_callers_text_in_the_log` sends the marker through all four routes over HTTP
+and checks the log: passes with the filter, fails with it removed (checked). Tests: 42. The `logs` command rerun
+against the fixed local server: no line contains the marker; the query shows the refusals without the text.
+
+**New `update` command**, because the fix is in the image: rolls the running service onto the image for the
+current commit, copying the current container settings (port, MCP_ALLOWED_HOSTS, log configuration) with only
+the image changed, and waits until that image is the only one running and /health and /mcp answer. Same charge:
+one task. Tested against the fake AWS: update, then a rerun skips; the log configuration and host survive.
+Step 6's pipeline will use it.
+
+Logging cost at this volume: the health checks are most of the lines (a few a minute, about 100 bytes each),
+so well under 1 MB a day; ingestion and storage come to pennies a month.

@@ -68,6 +68,25 @@ log = logging.getLogger("candidate-rag")
 # that would be one useless CloudWatch line per call. Its warnings and errors still show.
 logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
 
+
+class _NoCallerText(logging.Filter):
+    """Keeps what callers send out of the log. When a tool refuses a call, the SDK logs the refusal message at
+    INFO ("Tool 'get_profile' failed: \"No candidate with id '...'\""), and ours repeat what was sent so the
+    caller can correct it; a failed resource read is logged with the URI the caller asked for. Found 21/10 by
+    the marker check in `aws_deploy.py logs` (Part 3, Step 5): an unknown role and an unknown candidate id both
+    reached the log. The tool's name and the fact that it failed are kept; the caller's text is dropped.
+    (The SDK already logs only the field names when arguments fail validation.)"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg == "Tool %r failed: %r" and record.args:
+            record.msg, record.args = "Tool %r refused the call (its message is not logged)", (record.args[0],)
+        elif record.msg == "Resource %r failed: %r":
+            record.msg, record.args = "Resource read refused (URI and message not logged)", ()
+        return True
+
+
+logging.getLogger("mcp.server.mcpserver.server").addFilter(_NoCallerText())
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pydantic import BaseModel, ConfigDict, Field, StrictBool  # noqa: E402
 

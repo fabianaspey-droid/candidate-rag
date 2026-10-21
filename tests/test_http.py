@@ -85,3 +85,19 @@ def test_host_patterns_always_allow_local_and_add_public_hosts():
     assert hosts[:3] == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     assert "svc.ecs.eu-west-2.on.aws" in hosts and "svc.ecs.eu-west-2.on.aws:*" in hosts
     assert mcp_server._host_patterns("") == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+
+
+def test_refused_calls_never_put_the_callers_text_in_the_log(caplog):
+    # Part 3, Step 5 (21/10): the SDK logged our refusal messages, which repeat what the caller sent.
+    marker = "canary0123456789"
+    with caplog.at_level("INFO"), client() as c:
+        r1 = rpc(c, "tools/call", {"name": "search_candidates", "arguments": {"role": marker, "query": "credit control"}})
+        r2 = rpc(c, "tools/call", {"name": "get_profile", "arguments": {"candidate_id": marker}})
+        r3 = rpc(c, "tools/call", {"name": "search_candidates", "arguments": {"role": "semi-senior", "query": marker + " x" * 300}})
+        r4 = rpc(c, "resources/read", {"uri": f"jd://{marker}"})
+    assert [r.status_code for r in (r1, r2, r3, r4)] == [200, 200, 200, 200]
+    assert all(r.json()["result"]["isError"] for r in (r1, r2, r3))  # still refused, with the message, to the caller
+    assert marker in r1.json()["result"]["content"][0]["text"]
+    assert "error" in r4.json()
+    assert "refused the call" in caplog.text and "Resource read refused" in caplog.text  # still visible as events
+    assert marker not in caplog.text

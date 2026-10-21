@@ -11,7 +11,9 @@ Usage (from the candidate-rag folder, venv active, Docker Desktop running, `aws 
     python tools/aws_deploy.py repo       # create the ECR repository (pennies a month)
     python tools/aws_deploy.py push       # build from the current commit, push to ECR, show the scan
     python tools/aws_deploy.py create     # CREATE THE SERVICE: starts the ~US$1.33 a day charge
+    python tools/aws_deploy.py update     # move the running service to the image for the current commit
     python tools/aws_deploy.py status     # read-only: state, URL, image, running tasks, /health
+    python tools/aws_deploy.py logs       # Step 5: keep logs 14 days, prove no search text is logged, saved query
     python tools/aws_deploy.py delete     # delete the service: stops the charge (asks you to confirm)
 
 Each command is safe to run again: it skips what already exists and says so.
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -312,6 +315,43 @@ def set_allowed_host(svc: dict, url: str) -> None:
     say("OK" if ok else "FAIL", f"{url}/health: {health(url)}; /mcp with the right host: {'200' if ok else 'not yet'}")
 
 
+def cmd_update() -> None:
+    """Roll the running service onto the image built from the current commit (`push` first). Same charge as
+    before: one task at a time, the new one replacing the old once it is healthy."""
+    svc = find_service()
+    if not svc:
+        say("FAIL", f"service {SERVICE}: none running. Run `create` instead.")
+        sys.exit(1)
+    tag = git("rev-parse", "--short=12", "HEAD")
+    if not aws("ecr", "describe-images", "--repository-name", REPO, "--image-ids", f"imageTag={tag}", check=False):
+        say("FAIL", f"no image for the current commit ({tag}) in ECR. Run `push` first.")
+        sys.exit(1)
+    url = endpoint_of(svc)
+    current = svc["activeConfigurations"][0]["primaryContainer"]
+    if current.get("image", "").endswith(f":{tag}"):
+        say("SKIP", f"the service already runs image {tag}")
+    else:
+        # As in set_allowed_host: send the current container settings back with only the image changed.
+        container = {k: v for k, v in current.items() if v not in (None, [], {})}
+        container["image"] = f"{registry()}/{REPO}:{tag}"
+        aws("ecs", "update-express-gateway-service", "--service-arn", svc["serviceArn"],
+            "--primary-container", json.dumps(container))
+        say("OK", f"update to image {tag} requested; the new task replaces the old once healthy (often 5 to 10 minutes)")
+
+    def rolled_out() -> bool:
+        s = (aws("ecs", "describe-services", "--cluster", CLUSTER, "--services", svc["serviceArn"], check=False)
+             or {}).get("services", [{}])[0]
+        primary = [d for d in s.get("deployments", []) if d.get("status") == "PRIMARY"]
+        if len(s.get("deployments", [])) != 1 or not primary or primary[0].get("rolloutState") != "COMPLETED":
+            return False
+        td = aws("ecs", "describe-task-definition", "--task-definition", primary[0]["taskDefinition"], check=False)
+        image = ((td or {}).get("taskDefinition", {}).get("containerDefinitions") or [{}])[0].get("image", "")
+        return image.endswith(f":{tag}") and s.get("runningCount") == 1 and health(url).startswith("200") and mcp_answers(url)
+    ok = wait_until(rolled_out, f"waiting for image {tag} to be the only one running and healthy", minutes=20, every=20)
+    say("OK" if ok else "FAIL", f"running image {tag}, 1 task, /health {health(url)}" if ok
+        else "not rolled out after 20 minutes; run `status` and paste it with the service events")
+
+
 def mcp_answers(url: str) -> bool:
     try:
         import httpx
@@ -345,6 +385,112 @@ def cmd_status() -> None:
         say("INFO", f"/health: {health(url)}; /mcp answers: {mcp_answers(url)}")
 
 
+LOG_PREFIX = f"/aws/ecs/{CLUSTER}/{SERVICE}"  # Express Mode names the group after the service, plus a suffix
+RETENTION_DAYS = 14  # the default is to keep logs forever, which is a slow, silent cost
+QUERY_NAME = f"{SERVICE}/activity"
+# Everything except the load balancer's health checks (about 4 a minute, all "GET /health ... 200"), newest first.
+ACTIVITY_QUERY = ('fields @timestamp, @message\n| filter @message not like "GET /health"\n'
+                  '| sort @timestamp desc\n| limit 200')
+MCP_HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               "MCP-Protocol-Version": "2025-06-18"}
+
+
+def log_groups() -> list[dict]:
+    r = aws("logs", "describe-log-groups", "--log-group-name-prefix", LOG_PREFIX, check=False)
+    return (r or {}).get("logGroups", [])
+
+
+def tool_call(url: str, name: str, arguments: dict) -> tuple[int, bool | None]:
+    """(HTTP status, whether the tool reported an error) for one stateless MCP tool call."""
+    import httpx
+    r = httpx.post(f"{url.rstrip('/')}/mcp", timeout=60, headers=MCP_HEADERS,
+                   json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+    ok_json = r.headers.get("content-type", "").startswith("application/json")
+    return r.status_code, (r.json().get("result", {}).get("isError") if ok_json else None)
+
+
+def cmd_logs() -> None:
+    """Step 5. Sets retention, then proves two things with a made-up marker word: that the server's logs reach
+    CloudWatch, and that what someone searches for never does (only role, counts and filters are logged).
+    Four calls carry the marker: a normal search, a query over the 500-character limit (a validation error,
+    which repeats the input), an unknown role and an unknown candidate id (errors that name what was sent)."""
+    svc = find_service()
+    if not svc:
+        say("FAIL", f"service {SERVICE}: none running. Run `create` first.")
+        sys.exit(1)
+    url = endpoint_of(svc)
+    pc = (svc.get("activeConfigurations") or [{}])[0].get("primaryContainer", {})
+    groups = log_groups()
+    current = (pc.get("awsLogsConfiguration") or {}).get("logGroup") or \
+        (max(groups, key=lambda g: g.get("creationTime", 0))["logGroupName"] if groups else None)
+    if not current or current not in {g["logGroupName"] for g in groups}:
+        say("FAIL", f"no log group found under {LOG_PREFIX}; run `status` and paste it")
+        sys.exit(1)
+
+    # 1. Retention, on this service's group and any left by an earlier service of the same name.
+    for g in groups:
+        name = g["logGroupName"]
+        if g.get("retentionInDays") != RETENTION_DAYS:
+            aws("logs", "put-retention-policy", "--log-group-name", name, "--retention-in-days", str(RETENTION_DAYS))
+    for g in log_groups():
+        label = "this service" if g["logGroupName"] == current else "an earlier service"
+        say("OK" if g.get("retentionInDays") == RETENTION_DAYS else "FAIL",
+            f"{g['logGroupName']} ({label}): kept {g.get('retentionInDays', 'forever')} days, "
+            f"{g.get('storedBytes', 0) / 1e6:.2f} MB stored")
+
+    # 2. The marker calls.
+    marker = "canary" + secrets.token_hex(5)
+    since_ms = int(time.time() * 1000) - 60_000
+    calls = [
+        ("a normal search", "search_candidates", {"role": "semi-senior", "query": f"{marker} credit control", "n_results": 5}, False),
+        ("a query over 500 characters", "search_candidates", {"role": "semi-senior", "query": f"{marker} " + "x" * 600}, True),
+        ("an unknown role", "search_candidates", {"role": marker, "query": "credit control"}, True),
+        ("an unknown candidate id", "get_profile", {"candidate_id": marker}, True),
+    ]
+    for what, name, arguments, should_fail in calls:
+        status, is_error = tool_call(url, name, arguments)
+        ok = status == 200 and is_error is should_fail
+        say("OK" if ok else "FAIL", f"{what}: HTTP {status}, " + ("refused, as it should be" if is_error else "answered")
+            if ok else f"{what}: HTTP {status}, tool error {is_error} (expected {should_fail})")
+
+    def events(pattern: str) -> list[dict]:
+        r = aws("logs", "filter-log-events", "--log-group-name", current, "--start-time", str(since_ms),
+                "--filter-pattern", pattern, check=False)
+        return (r or {}).get("events", [])
+    arrived = wait_until(lambda: events('"search_candidates role=semi-senior"'),
+                         "waiting for the server's log line to reach CloudWatch", minutes=4, every=10)
+    if not arrived:
+        say("FAIL", "the normal search's log line hasn't reached CloudWatch after 4 minutes, so nothing below "
+                    "can be trusted; paste this")
+        sys.exit(1)
+    say("OK", f"logs reach CloudWatch: {arrived[-1]['message'].strip()[-110:]}")
+    time.sleep(15)  # let the error calls' lines (if any) arrive too
+    leaked = events(f'"{marker}"')
+    say("OK" if not leaked else "FAIL", "no log line contains the marker: what was searched for is not logged"
+        if not leaked else f"{len(leaked)} log line(s) contain the marker (the text that was sent):")
+    for e in leaked[:5]:
+        print("      " + e["message"].strip()[:200])
+
+    # 3. The saved query, then run it once over the last hour.
+    found = aws("logs", "describe-query-definitions", "--query-definition-name-prefix", QUERY_NAME)
+    existing = [q for q in found.get("queryDefinitions", []) if q.get("name") == QUERY_NAME]
+    aws("logs", "put-query-definition", "--name", QUERY_NAME, "--query-string", ACTIVITY_QUERY,
+        "--log-group-names", current, *(["--query-definition-id", existing[0]["queryDefinitionId"]] if existing else []))
+    say("OK", f"saved query '{QUERY_NAME}' {'updated' if existing else 'created'} (CloudWatch > Logs Insights > Saved queries)")
+    now = int(time.time())
+    qid = aws("logs", "start-query", "--log-group-name", current, "--start-time", str(now - 3600),
+              "--end-time", str(now), "--query-string", ACTIVITY_QUERY)["queryId"]
+    res = wait_until(lambda: (r := aws("logs", "get-query-results", "--query-id", qid))["status"] in
+                     ("Complete", "Failed", "Cancelled", "Timeout") and r, "running the saved query", minutes=2, every=3)
+    if not res or res["status"] != "Complete":
+        say("FAIL", f"saved query did not complete: {(res or {}).get('status', 'no answer after 2 minutes')}")
+        sys.exit(1)
+    rows = [{f["field"]: f["value"] for f in row} for row in res.get("results", [])]
+    say("OK" if rows else "FAIL", f"saved query over the last hour: {len(rows)} lines that aren't health checks; newest:")
+    for row in rows[:8]:
+        print(f"      {row.get('@timestamp', '')[:19]}  {row.get('@message', '').strip()[:130]}")
+
+
 def cmd_delete() -> None:
     svc = find_service()
     if not svc:
@@ -366,7 +512,7 @@ def cmd_delete() -> None:
 
 def main() -> int:
     commands = {"check": cmd_check, "roles": cmd_roles, "repo": cmd_repo, "push": cmd_push,
-                "create": cmd_create, "status": cmd_status, "delete": cmd_delete}
+                "create": cmd_create, "update": cmd_update, "status": cmd_status, "logs": cmd_logs, "delete": cmd_delete}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         print(__doc__)
         return 2
