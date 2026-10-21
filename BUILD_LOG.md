@@ -1401,3 +1401,94 @@ stays 0.25 vCPU / 1 GB. Not exercised: Fargate's own hardware and network, pulli
 and an explicit check that search lines reach `docker logs` (the start-up and "stopped" lines do, which is
 the same stream; Step 5 checks search lines in CloudWatch). The 512 MB comparison was last run before the
 speed fix (peak 243 MiB then).
+
+**Checkpoint (21/10, 11:16), local only, not pushed:** check_public CLEAN (38 files, 6 private terms, 465
+employers, 232 names). `git status` listed 12 files, none under data/, jds/ or chroma/. Commit a3fff01, "Part
+3 Steps 1-3: HTTP transport, container, memory and speed fixes", 12 files, 1,310 insertions.
+
+## Step 0: AWS account (21/10)
+
+**The account was created through AWS's new sign-up experience, and its Region is fixed.** Fabian (11:57):
+"My current region is automatically assigned (eu-north-1 (Europe - Stockholm))", with London apparently not
+available. Checked the docs ("AWS Regions for your projects", "Compare sign-up options"): the new
+experience assigns the project to one of three Regions by the country in the contact address (us-east-2,
+eu-north-1, ap-southeast-2; the United Kingdom maps to Stockholm), and "You cannot modify your AWS Region".
+The only ways to another Region are activating advanced features ("Activation cannot be reversed"; it also
+turns on AWS Organizations and IAM Identity Center, the things the brief avoids) or a separate account through
+"Sign up for AWS (advanced)".
+
+**Claims in the guide this breaks, named so they get corrected:** (1) "Region: eu-west-2 (London)". (2) Step
+0's root-user MFA and console IAM user: in the new experience there is no root user (an AWS Builder ID owns
+the account), and IAM users "can only be used for programmatic access, not console access". (3) The guide
+didn't know spend limits exist here; they need the paid plan, so they don't apply on the free plan.
+
+**Decision, 21/10:** stay in Stockholm (eu-north-1). Fabian carried on with Step 0 on that basis. Reason as
+put to him: London was there to keep logs in the UK, which mattered for real data; the server only ever holds
+the invented sample; Stockholm is in the EU and runs ECS, Fargate and load balancers the same way; moving
+would need an irreversible change (advanced features) or a second account.
+
+**MFA:** already registered on the Builder ID at sign-up, which in this account type is the AWS login itself.
+
+**Budget** "AWS - RAG server": cost budget, $50 monthly, recurring, unblended; scope "Filter specific AWS
+cost dimensions" with **Charge type Credit and Refund excluded**. That option is no longer under Advanced
+options in the console, which now says to use Charge type as a filter dimension. AWS counts credits by
+default (IncludeCredit defaults to true), so without this the budget would read about zero until the credit
+ran out. Alerts at 50% and 80% actual and 100% forecasted, to Fabian's email.
+
+**Credit activities listed (0 of 5, US$20 each):** launch an EC2 instance; use a model in the Bedrock
+playground; set up a cost budget; create a web app with Lambda; create an Aurora or RDS database. The budget
+activity still showed "Not started" just after the budget was created; to recheck later.
+
+**CLI, with no access keys:** AWS CLI 2.38.3. `aws login` asked for a Region first (eu-north-1 given), then
+offered to configure AWS skills and an AWS MCP server for AI coding agents (declined: "n"; it would change
+other tools' config files and isn't needed). Sign-in through the Builder ID worked. `aws sts
+get-caller-identity` returns an **assumed role, `AccountFullAccessRole`**, not an IAM user, which is how this
+account type gives console identities programmatic access; region eu-north-1; no `.aws\credentials` file
+(Test-Path False). The account ID is deliberately not written here, because this log is public.
+
+**Price, AWS Pricing Calculator, Europe (Stockholm), 21/10:** Application Load Balancer (1 ALB; 0.01 GB/hour
+processed to IP targets, 1 new connection/s, 1 s duration, 1 request/s, 1 rule evaluation), Fargate (Linux,
+x86, 1 task a month for 730 hours, 0.25 vCPU, 1 GB, 20 GB ephemeral), 3 in-use public IPv4 addresses:
+**US$40.35 a month**, no upfront cost. In line with the guide's estimate of about $38 at US East rates. The
+billing page shows the Free plan with the US$100 credit: about 2.5 months of running time, more if the
+other four credit activities are earned.
+
+**Consequence to plan for:** on the free plan the account closes when the credits run out. So the service is
+deleted when not needed for interviews, and well before the credit is used up, unless Fabian decides to
+upgrade to the paid plan.
+
+**Step 0 status:** everything identified is done. Not exercised: the budget alert emails (they fire only on
+real spend) and whether this account type allows Fargate and a load balancer; both come in Step 4.
+
+## Step 4: ECR and deployment to ECS Express Mode (21/10)
+
+**Go-ahead:** Fabian, 12:33, "Yes", after the cost was stated: US$40.35 a month (about US$1.33 a day) from
+the Pricing Calculator for Stockholm, covered by the US$100 credit for about 2.5 months; on the free plan the
+account closes if the credit runs out, so the service gets deleted when not needed.
+
+**Checked against AWS's documentation before writing:** the Express Mode getting-started page (role names
+`ecsTaskExecutionRole` trusted by ecs-tasks.amazonaws.com and `ecsInfrastructureRoleForExpressServices`
+trusted by ecs.amazonaws.com; new roles can take about a minute before Express Mode can use them); the managed
+policy ARNs (`service-role/AmazonECSTaskExecutionRolePolicy`, `service-role/AmazonECSInfrastructureRolefor
+ExpressGatewayServices`, the latter v6, scoped to resources tagged AmazonECSManaged); the API references for
+CreateExpressGatewayService, UpdateExpressGatewayService and describe (the URL is at
+`activeConfigurations[].ingressPaths[].endpoint`). Not verified: the exact name of the delete command, and
+whether this account type allows Fargate and a load balancer at all.
+
+**New files:**
+- `deploy/trust-ecs-tasks.json`, `deploy/trust-ecs-infrastructure.json`: the two roles' trust policies.
+- `deploy/ecr-lifecycle.json`: keep the newest three images.
+- `deploy/express-service.json`: everything about the service that's safe to publish: name, 256 CPU units,
+  1024 MiB, x86_64, health path /health, container port 8000, scaling min 1 / max 1, tags. No account number:
+  the role ARNs and the image address are filled in at run time.
+- `tools/aws_deploy.py`: one command per part of the step (check, roles, repo, push, create, status,
+  delete), each safe to rerun. `push` refuses uncommitted changes and tags the image with the commit, so
+  every running image traces to exact code. `create` fills a temporary settings file (deleted straight after,
+  because it holds the account number), waits for the URL, then updates MCP_ALLOWED_HOSTS to the service's
+  hostname, keeping every other container setting (the update sends the whole current container back, so
+  the log configuration can't be reset). `delete` asks for the service name, then checks no load balancer is
+  left. No task role: the server calls no AWS service, so it has no AWS permissions at all.
+
+**Exercised in the build workspace against a fake AWS CLI and fake Docker** (no real AWS reachable there):
+every command's path, reruns skipping what exists, push refusing a dirty tree, the update payload keeping
+awsLogsConfiguration, delete refusing a wrong name. That proves the script's logic, not AWS's behaviour.

@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "Keep the newest three images; older ones can be rebuilt from their commit",
+      "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 3},
+      "action": {"type": "expire"}
+    }
+  ]
+}
