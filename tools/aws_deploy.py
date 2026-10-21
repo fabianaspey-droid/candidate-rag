@@ -185,7 +185,11 @@ def cmd_push() -> None:
     engine = subprocess.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
                             capture_output=True, text=True).stdout.strip()
     with tempfile.TemporaryDirectory(prefix="candidate_rag_docker_") as cfg:
-        (Path(cfg) / "config.json").write_text('{"auths": {}}', encoding="utf-8")
+        # One (empty) entry for the registry, not an empty list: when the file has no logins at all, Docker
+        # treats it as unconfigured and falls back to the platform's store, which on Windows is the same
+        # Credential Manager (docker/cli: `if !configFile.ContainsAuth() { ... DetectDefaultStore ... }`).
+        # Seen 21/10: the first version of this fix used {"auths": {}} and failed the same way.
+        (Path(cfg) / "config.json").write_text(json.dumps({"auths": {registry(): {}}}), encoding="utf-8")
         env = dict(os.environ, DOCKER_CONFIG=cfg, **({"DOCKER_HOST": engine} if engine else {}))
         password = aws("ecr", "get-login-password")
         run(["docker", "login", "--username", "AWS", "--password-stdin", registry()], input_text=password, env=env)

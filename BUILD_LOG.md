@@ -1511,3 +1511,17 @@ credential store, deleted as soon as the push ends, so the 12-hour token never l
 Fabian's normal Docker settings are untouched. DOCKER_HOST is set to Docker Desktop's current engine, which
 would otherwise be lost along with the default settings folder. Tested against the fake Docker: both login
 and push saw the temporary folder and the Desktop engine, and no folder was left behind.
+
+**Fabian's rerun (14:32): the same error.** Commit b493b4a; push built from it, then `docker login` failed
+again with "The stub received bad data." **My first fix was wrong.** Read the Docker CLI source
+(docker/cli, cli/config/config.go and configfile/file.go): when loading the settings file,
+`if !configFile.ContainsAuth() { configFile.CredentialsStore = credentials.DetectDefaultStore(...) }`, and
+ContainsAuth is false when there is no credsStore, no credHelpers and **no entries in auths**; on Windows
+DetectDefaultStore returns "wincred" whenever docker-credential-wincred is on PATH. The temporary file held
+`{"auths": {}}`, an empty list, so Docker fell straight back to Windows Credential Manager.
+
+**Fix:** the temporary file now holds one empty entry for the registry, `{"auths": {"<registry>": {}}}`
+(the "empty auth config for your registry" workaround in aws/aws-cli issue 5636), so ContainsAuth is true,
+no default store is detected, and the login is written to the temporary folder, deleted after the push.
+Tested against a fake Docker that applies the same rule: the previous version fails with the same message,
+the new one logs in and pushes.
