@@ -1717,3 +1717,73 @@ scan that appears late passes; one that never appears FAILs after 5 minutes. Not
 **Step 5 status:** everything identified is done. Not exercised: a log line from a real crash (none has
 happened; the unexpected-exception path logs a traceback, which names no caller text in our code but was not
 forced); the stored size, which CloudWatch reports with a delay (0.00 MB so far).
+
+Step 5 committed and pushed by Fabian (commit 041f12f).
+
+## Step 6: GitHub Actions CI/CD (21/10)
+
+Definition of done: tests and container checks on every push and pull request; on main, after an approval,
+the image pushed and the live service rolled onto it, then checked; no AWS keys stored anywhere; the account
+number and the service URL not in the (public) logs.
+
+**Checked against current documentation before writing (21/10):**
+- GitHub changelog, 23/04/2026, "Immutable subject claims for GitHub Actions OIDC tokens": repositories created
+  after 15/07/2026 get a subject with the owner's and repository's numeric IDs, `repo:OWNER@OWNER_ID/REPO@REPO_ID:...`
+  (this repository was created 14/10/2026, so it has the new form). The documented example is for a branch;
+  **the environment form, `repo:fabianaspey-droid@<owner id>/candidate-rag@<repo id>:environment:production`,
+  is inferred from GitHub's pattern, not quoted.** So the deploy job prints the subject it actually receives
+  (not a secret) before asking AWS for credentials; a mismatch shows on the first run.
+- Action versions, pinned to commit hashes, read from each repository's tags with `git ls-remote`:
+  actions/checkout v7.0.1, actions/setup-python v7.0.0, actions/setup-node v7.1.0,
+  aws-actions/configure-aws-credentials v6.3.0 (released 15/09/2026).
+- UpdateExpressGatewayService API reference: only serviceArn is required; the page names no IAM permissions.
+  **The deploy role's ECS action names (ecs:DescribeExpressGatewayService, ecs:UpdateExpressGatewayService) and
+  whether iam:PassRole is needed on update are not confirmed by a page;** included on that basis, to be shown
+  by the first run (an AccessDenied names the missing action).
+
+**What was built:**
+- `aws_deploy.py github`: creates GitHub's identity provider in IAM (audience sts.amazonaws.com) if missing,
+  and the role `candidate-rag-github-deploy`, trusted only for that subject (repository and owner IDs looked
+  up from GitHub's API at run time). Its permissions are in `deploy/github-deploy-policy.json`, with the account
+  number filled in at run time: log in to ECR, push and read this one repository, read and update services in
+  Stockholm only, and hand the two existing ECS roles back to ECS. It cannot create, delete or touch IAM. It
+  prints the role's ARN for a GitHub environment secret. Free.
+- `aws_deploy.py endpoint`: prints only the URL (or nothing), for the pipeline to mask.
+- `.github/workflows/ci-cd.yml`: job `test` (push and pull request): pytest, the Docker build, then
+  `check_container.py` (which runs check_http.py and the 12 Inspector checks inside it; Node 24 installed for
+  the Inspector). Job `deploy` (push to main only, after `test`): environment `production`, which waits for
+  Fabian's approval; prints the token's subject; configure-aws-credentials with the role; masks the account
+  number and the URL; `push`, then `update` and `check_http.py --url` if a service exists (if it was deleted to
+  save money, it pushes and says so). `check_public.py` can't run there (it needs the real data); it stays the
+  local check before every push.
+- README: a section on the remote server (the choices and why, how it runs, how it is checked), the layout,
+  and the test count (32 to 42).
+
+**Checked here before handing over:** actionlint: clean. `github` against the fake AWS, with GitHub's answer
+stood in: run twice (creates, then skips the provider and resets the trust), the trust policy has exactly the
+subject and audience, the policy has the account filled in and no placeholder left, no temporary files left.
+`endpoint` prints only the URL.
+
+**Correction:** the repository was created 08/10/2026, not 14/10 as written above (GitHub's API, via the
+`github` command). Still after 15/07/2026, so the new subject format stands.
+
+**`github` on the real account (16:25): refused by AWS, and not fixable from inside the account.**
+"not authorized to perform: iam:ListOpenIDConnectProviders on resource: ...oidc-provider/* with an explicit deny
+in a service control policy". The Free plan account (AWS's new sign-up experience) sits in an organisation
+AWS manages, and its policy denies identity providers. An explicit deny in a service control policy can't be
+overridden by any permission in the account. **Failed claim, named:** the build guide's Step 6 plan assumed
+GitHub OIDC was available on this account; it isn't. AWS's Free Tier FAQ says the Free plan's limitations are
+removed by upgrading to the Paid plan, but no page says this particular policy goes with them, and the upgrade
+can't be undone and ends the account's protection of closing when the credits run out (charges would then go
+to the card). Not done.
+
+**Decision (pushed back on the alternatives):** an IAM user with access keys stored in GitHub would work today,
+but breaks the rule of no access keys anywhere, for a demo; upgrading the plan only for this is irreversible. So:
+the pipeline's `test` job (tests, image build, container checks) runs on every push and pull request as
+designed; the `deploy` job stays in the workflow, written and linted, but is switched off by a repository
+variable, `DEPLOY_ENABLED`, which is not set. Deploys run from the laptop, signed in with `aws login`:
+`push`, then `update`. On a paid plan: `aws_deploy.py github`, the environment and secret in GitHub, then set
+the variable. README and the `github` command's description say this plainly.
+
+Nothing was created in AWS (the first call was refused). The `production` environment and the AWS_ROLE_ARN
+secret in GitHub are not needed now.

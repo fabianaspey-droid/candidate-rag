@@ -127,7 +127,7 @@ Python 3.11 or later.
 python -m venv .venv
 # Windows: .venv\Scripts\activate     macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest -q tests                  # 32 tests, no API calls
+python -m pytest -q tests                  # 42 tests, no API calls
 python src/index.py --sample               # first run downloads the embedding model (about 80 MB)
 python src/retrieve.py --sample
 python src/evaluate.py --sample            # writes sample/out/RESULTS.md
@@ -206,6 +206,49 @@ clone and its virtual environment, then quit the app fully and reopen it:
 If the file already holds settings, add the `mcpServers` block alongside them rather than replacing the
 file. Run `python src/index.py --sample` first so the sample index exists.
 
+## Remote MCP server on AWS (sample only)
+
+The same server also runs over Streamable HTTP, so it can be added to Claude by URL (claude.ai, Customize >
+Connectors, custom connector) with nothing installed. It is deployed on **Amazon ECS Express Mode**
+(Fargate, Stockholm), serving only the invented sample, with no sign-in. The URL is handed to people
+directly rather than published here.
+
+**Why these choices**
+
+- **No sign-in.** Matched to the risk: the data is the public sample, every tool is read-only, there is no
+  paid API behind it, and it is fixed at one task, so traffic makes it slower, not dearer. OAuth would add a
+  sign-in an interviewer doesn't have and protect nothing. Host and browser-origin checks still apply
+  (another host is refused; a foreign origin gets 403). A version with real data would need OAuth first.
+- **ECS Express Mode over Lightsail:** one call gives a load balancer, HTTPS, a URL, canary deployments and
+  CloudWatch logs, on the standard ECS, ECR and IAM pieces that carry over to real work, for about US$40 a
+  month (estimated with the AWS Pricing Calculator; the account's credits cover it). Lightsail's container
+  service is cheaper and simpler; it was the fallback. App Runner is closed to new customers.
+- **0.25 vCPU, 1 GB.** Measured, not guessed: ten parallel searches once took the container past 1 GB and
+  it was killed. Searches now run one at a time and glibc is limited to two memory arenas; the peak fell
+  from 755 MiB to 286 MiB. Query embedding was rewritten to skip padding to 256 tokens and use one thread
+  (identical vectors and rankings, checked on the real model): embedding a query went from 1.0 s to 0.04 s.
+- **Nothing the caller sends is logged.** Search logs only role, counts and filters. A marker check sends a
+  made-up word through a search, an over-long query, an unknown role and an unknown id, then searches
+  CloudWatch for it; it found the SDK logging refusal messages (which repeat what was sent), now filtered
+  out. Logs are kept 14 days.
+
+**How it runs.** `Dockerfile` builds a non-root, read-only image holding only the server, the sample and
+its index (an allowlist `.dockerignore`), with base image and packages pinned. `tools/aws_deploy.py` does
+each AWS step with a check: `check`, `roles`, `repo`, `push`, `create`, `update`, `status`, `logs`,
+`delete`, `github`. The account number is looked up at run time and never written to a file.
+`.github/workflows/ci-cd.yml` runs the tests and the container checks on every push and pull request. Its
+deploy job (push the image, roll the service onto it, check the live URL, after approval in a `production`
+environment) is written for OpenID Connect, so no AWS keys would be stored anywhere, but it is switched
+off: the AWS Free plan account's service control policy denies creating GitHub's identity provider in
+IAM. Deploys run from the laptop instead (`push`, then `update`), signed in with `aws login`. On a paid
+plan, `aws_deploy.py github` creates the role and setting `DEPLOY_ENABLED` turns the job on.
+
+**Checked by:** `tools/check_container.py` (the image's contents and user, then a container under the
+Fargate limits with a read-only filesystem: healthy, `check_http.py`, the 12 Inspector checks, peak memory,
+nothing written, clean stop on SIGTERM); `tools/check_http.py --url` against the live service (10 checks,
+including the host and origin refusals and ten searches at once); the Inspector over HTTP; and the claude.ai
+connector, which needed no sign-in and returned the same shortlist as the local server.
+
 ## Layout
 
 ```
@@ -213,7 +256,10 @@ src/        ingest, index, search, retrieve, rerank, agent, evaluate, mcp_server
 tests/      guards, agent loop (scripted fake Claude), double-run upsert, the MCP server through the MCP layer
 sample/     invented profiles, adverts and answer key
 tools/      make_sample.py; check_public.py (scans everything git would publish for real data);
-            check_guards.py and inspector_check.py (the MCP server's guard and Inspector checks)
+            check_guards.py and inspector_check.py (the MCP server's guard and Inspector checks);
+            check_http.py, check_container.py, check_query_embedding.py; aws_deploy.py (the AWS steps)
+deploy/     the AWS settings that are safe to publish (roles' trust, service size, ECR lifecycle, deploy policy)
+Dockerfile, .dockerignore, .github/workflows/ci-cd.yml   the image and the pipeline
 BUILD_LOG.md  the decisions and checks, step by step, as they were made
 RESULTS.md    the real run, counts only
 ```

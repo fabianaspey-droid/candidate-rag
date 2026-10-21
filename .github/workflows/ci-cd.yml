@@ -1,0 +1,109 @@
+# CI/CD for candidate-rag (Part 3, Step 6).
+#
+# Every push and pull request: the unit tests, then the Docker image built and checked under the same limits as
+# the Fargate task (tools/check_container.py, which also runs check_http.py and the 12 Inspector checks).
+# A push to main, after the tests pass and Fabian approves the `production` environment: push the image to ECR
+# and roll the running service onto it, then check the live service.
+#
+# No AWS keys anywhere: the deploy job gets credentials for under an hour by OpenID Connect, for an IAM role that
+# trusts only this repository's `production` environment (tools/aws_deploy.py github). The only thing stored in
+# GitHub is that role's ARN, as an environment secret. The account number and the service URL are masked in the
+# logs, because the logs of a public repository are public.
+#
+# Sample data only: the runner checks out this repository, which holds no real data. check_public.py stays a
+# local pre-push check, because it needs the real data to compare against.
+#
+# Actions are pinned to full commit hashes (a tag can be moved; a hash can't); the version is in the comment.
+
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false  # never cut a deployment off halfway
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "24"  # the Inspector needs at least 22.19
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m pytest -q tests
+      - name: Build the image
+        run: docker build --provenance=false --sbom=false -t candidate-rag-mcp:local .
+      - name: Container checks (1 GB, 0.25 vCPU, read-only filesystem)
+        run: python tools/check_container.py
+
+  deploy:
+    needs: test
+    # Off until the repository variable DEPLOY_ENABLED is 'true'. On 21/10 AWS refused to create GitHub's identity
+    # provider: the Free plan account's service control policy denies it. Until then, deploys run from the laptop.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production  # waits for Fabian's approval in GitHub before any step runs
+    permissions:
+      contents: read
+      id-token: write  # lets the job ask GitHub for its OpenID Connect token
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: pip install httpx==0.28.1
+      - name: Show this job's OpenID Connect subject (not a secret; it is what the AWS role must trust)
+        run: |
+          python - <<'EOF'
+          import base64, json, os, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
+          req = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req))["value"]
+          body = token.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+          print("sub:", claims["sub"])
+          print("aud:", claims["aud"])
+          EOF
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+          mask-aws-account-id: true
+      - name: Mask the account number
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+      - name: Push the image to ECR and check its scan
+        run: python tools/aws_deploy.py push
+      - name: Find the service
+        run: |
+          url="$(python tools/aws_deploy.py endpoint)"
+          if [ -n "$url" ]; then echo "::add-mask::${url#https://}"; echo "::add-mask::$url"; fi
+          echo "SERVICE_URL=$url" >> "$GITHUB_ENV"
+      - name: Roll the service onto the new image
+        if: env.SERVICE_URL != ''
+        run: python tools/aws_deploy.py update
+      - name: Check the live service
+        if: env.SERVICE_URL != ''
+        run: python tools/check_http.py --url "$SERVICE_URL"
+      - name: No service running
+        if: env.SERVICE_URL == ''
+        run: echo "No service is running (deleted to save money), so the image is pushed and nothing is updated."

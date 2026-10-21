@@ -15,6 +15,8 @@ Usage (from the candidate-rag folder, venv active, Docker Desktop running, `aws 
     python tools/aws_deploy.py status     # read-only: state, URL, image, running tasks, /health
     python tools/aws_deploy.py logs       # Step 5: keep logs 14 days, prove no search text is logged, saved query
     python tools/aws_deploy.py delete     # delete the service: stops the charge (asks you to confirm)
+    python tools/aws_deploy.py github     # Step 6: let GitHub Actions deploy, with no stored keys (free)
+    python tools/aws_deploy.py endpoint   # print the service's URL, or nothing if none (for the pipeline)
 
 Each command is safe to run again: it skips what already exists and says so.
 """
@@ -504,6 +506,80 @@ def cmd_logs() -> None:
         print(f"      {row.get('@timestamp', '')[:19]}  {row.get('@message', '').strip()[:130]}")
 
 
+GITHUB_REPO = "fabianaspey-droid/candidate-rag"
+GITHUB_ENVIRONMENT = "production"  # the GitHub environment whose jobs may deploy; it has a required reviewer
+OIDC_HOST = "token.actions.githubusercontent.com"
+DEPLOY_ROLE = "candidate-rag-github-deploy"
+
+
+def cmd_github() -> None:
+    """Step 6: an IAM role that only GitHub Actions jobs in this repository's `production` environment can take,
+    by OpenID Connect: GitHub signs a short-lived token for the job, AWS checks it, and the job gets credentials
+    for under an hour. Nothing is stored in GitHub except the role's ARN. The role can push to this ECR
+    repository and update services in Stockholm, nothing else (deploy/github-deploy-policy.json).
+
+    The trust condition uses GitHub's newer subject format, with the owner's and repository's numeric IDs as well
+    as their names (GitHub changelog, 23/04/2026: the default for repositories created after 15/07/2026; this one
+    was created 14/10/2026). A deleted-and-recreated repository with the same name gets a new ID, so it can't
+    take the role. The environment form below is inferred from GitHub's documented pattern, not quoted from it:
+    the pipeline prints the subject it actually receives, so a mismatch shows up on the first run.
+
+    Blocked on this account (21/10): "not authorized to perform: iam:ListOpenIDConnectProviders ... with an explicit
+    deny in a service control policy". The Free plan account sits in an organisation AWS manages, whose policy
+    denies GitHub-style identity providers; no permission in the account can override an explicit deny. The
+    pipeline's deploy job stays off until this works (repository variable DEPLOY_ENABLED)."""
+    import httpx
+    r = httpx.get(f"https://api.github.com/repos/{GITHUB_REPO}", timeout=20, headers={"Accept": "application/vnd.github+json"})
+    if r.status_code != 200:
+        say("FAIL", f"GitHub API answered {r.status_code} for {GITHUB_REPO}")
+        sys.exit(1)
+    info = r.json()
+    sub = (f"repo:{info['owner']['login']}@{info['owner']['id']}/{info['name']}@{info['id']}"
+           f":environment:{GITHUB_ENVIRONMENT}")
+    say("OK", f"{GITHUB_REPO}: repository id {info['id']}, owner id {info['owner']['id']}, created {info['created_at'][:10]}")
+    acct = account()
+    provider_arn = f"arn:aws:iam::{acct}:oidc-provider/{OIDC_HOST}"
+    providers = aws("iam", "list-open-id-connect-providers", region=False)["OpenIDConnectProviderList"]
+    if provider_arn in {p["Arn"] for p in providers}:
+        say("SKIP", f"identity provider {OIDC_HOST} already exists")
+    else:
+        aws("iam", "create-open-id-connect-provider", "--url", f"https://{OIDC_HOST}",
+            "--client-id-list", "sts.amazonaws.com", region=False)
+        say("OK", f"created identity provider {OIDC_HOST} (audience sts.amazonaws.com)")
+    trust = {"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"Federated": provider_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {"StringEquals": {f"{OIDC_HOST}:aud": "sts.amazonaws.com", f"{OIDC_HOST}:sub": sub}}}]}
+    policy = (DEPLOY / "github-deploy-policy.json").read_text(encoding="utf-8").replace("ACCOUNT_ID", acct)
+    json.loads(policy)
+    with tempfile.TemporaryDirectory(prefix="candidate_rag_iam_") as d:  # hold the account number; deleted after
+        tp, pp = Path(d) / "trust.json", Path(d) / "policy.json"
+        tp.write_text(json.dumps(trust), encoding="utf-8")
+        pp.write_text(policy, encoding="utf-8")
+        if role_arn(DEPLOY_ROLE):
+            aws("iam", "update-assume-role-policy", "--role-name", DEPLOY_ROLE, "--policy-document", f"file://{tp}", region=False)
+            say("OK", f"{DEPLOY_ROLE} exists; trust policy set again")
+        else:
+            aws("iam", "create-role", "--role-name", DEPLOY_ROLE, "--assume-role-policy-document", f"file://{tp}",
+                "--description", f"GitHub Actions deploys for {GITHUB_REPO}, {GITHUB_ENVIRONMENT} environment only", region=False)
+            say("OK", f"created {DEPLOY_ROLE}")
+        aws("iam", "put-role-policy", "--role-name", DEPLOY_ROLE, "--policy-name", "deploy-candidate-rag-mcp",
+            "--policy-document", f"file://{pp}", region=False)
+    got = aws("iam", "get-role", "--role-name", DEPLOY_ROLE, region=False)["Role"]
+    cond = got["AssumeRolePolicyDocument"]["Statement"][0]["Condition"]["StringEquals"]
+    say("OK" if cond.get(f"{OIDC_HOST}:sub") == sub else "FAIL", f"{DEPLOY_ROLE} trusts only: {cond.get(f'{OIDC_HOST}:sub')}")
+    perms = aws("iam", "get-role-policy", "--role-name", DEPLOY_ROLE, "--policy-name", "deploy-candidate-rag-mcp", region=False)
+    actions = sorted({a for st in perms["PolicyDocument"]["Statement"] for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])})
+    say("OK", f"{DEPLOY_ROLE} may: {', '.join(actions)}")
+    print(f"\nIn GitHub, Settings > Environments > {GITHUB_ENVIRONMENT} > Environment secrets, add AWS_ROLE_ARN with this value:")
+    print(f"  {got['Arn']}")
+
+
+def cmd_endpoint() -> None:
+    """The service's URL alone, or nothing if no service is running. The pipeline masks it before use."""
+    svc = find_service()
+    print((endpoint_of(svc) or "") if svc else "")
+
+
 def cmd_delete() -> None:
     svc = find_service()
     if not svc:
@@ -525,7 +601,8 @@ def cmd_delete() -> None:
 
 def main() -> int:
     commands = {"check": cmd_check, "roles": cmd_roles, "repo": cmd_repo, "push": cmd_push,
-                "create": cmd_create, "update": cmd_update, "status": cmd_status, "logs": cmd_logs, "delete": cmd_delete}
+                "create": cmd_create, "update": cmd_update, "status": cmd_status, "logs": cmd_logs, "delete": cmd_delete,
+                "github": cmd_github, "endpoint": cmd_endpoint}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         print(__doc__)
         return 2
