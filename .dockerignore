@@ -1,0 +1,17 @@
+# .dockerignore  -  an allowlist (Part 3, Step 3).
+#
+# The first line ignores everything; the lines after it let back in only what the server image needs. So
+# data/, jds/, chroma/, .env, .venv/ and .git/ can never enter the build context, and a new folder added
+# later (real data included) is excluded without anyone having to remember to list it here.
+#
+# The Part 1 scripts that call Claude (rerank.py, agent.py) and read the source database (ingest.py) are
+# left out too: the server doesn't use them, so the image doesn't carry them.
+*
+!requirements-server.txt
+!src/mcp_server.py
+!src/search.py
+!src/paths.py
+!src/index.py
+!src/retrieve.py
+!sample/profiles.jsonl
+!sample/jds/

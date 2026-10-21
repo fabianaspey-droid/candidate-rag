@@ -10,8 +10,11 @@ Node.js 22.19 or later. It keeps a small catalog file in your user folder (.mcp-
 touch this project. Secrets are kept in memory only (MCP_INSPECTOR_SECRET_STORE=memory).
 
 Usage (from the candidate-rag folder, venv active):
-    python tools/inspector_check.py
+    python tools/inspector_check.py                                   # stdio: the Inspector launches the server
+    python tools/inspector_check.py --http http://127.0.0.1:8000/mcp  # Streamable HTTP: a server already running
+                                                                      # (Part 3), the same 12 checks
 """
+import argparse
 import json
 import os
 import shutil
@@ -21,6 +24,7 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
 INSPECTOR = "@modelcontextprotocol/inspector@2.9.0"
+HTTP_URL = None  # set by --http; None means stdio
 results = []
 
 
@@ -31,7 +35,10 @@ def record(name: str, ok: bool, detail: str) -> None:
 
 def inspector(*args: str) -> tuple[dict | None, str, int]:
     npx = shutil.which("npx")
-    cmd = [npx, "-y", INSPECTOR, "--cli", sys.executable, str(PROJECT / "src" / "mcp_server.py"), *args]
+    if HTTP_URL:
+        cmd = [npx, "-y", INSPECTOR, "--cli", "--transport", "http", "--server-url", HTTP_URL, *args]
+    else:
+        cmd = [npx, "-y", INSPECTOR, "--cli", sys.executable, str(PROJECT / "src" / "mcp_server.py"), *args]
     env = dict(os.environ, MCP_INSPECTOR_SECRET_STORE="memory")
     p = subprocess.run(cmd, cwd=PROJECT, capture_output=True, text=True, encoding="utf-8", errors="replace",
                        env=env, timeout=180)
@@ -42,6 +49,11 @@ def inspector(*args: str) -> tuple[dict | None, str, int]:
 
 
 def main() -> int:
+    global HTTP_URL
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--http", metavar="URL", help="check a running server over Streamable HTTP, e.g. http://127.0.0.1:8000/mcp")
+    HTTP_URL = ap.parse_args().http
+    print(f"transport: {'Streamable HTTP, ' + HTTP_URL if HTTP_URL else 'stdio (the Inspector launches the server)'}")
     if not shutil.which("npx") or not shutil.which("node"):
         print("FAIL  Node.js not found. Install Node.js 22.19 or later, then open a new PowerShell window.")
         return 1

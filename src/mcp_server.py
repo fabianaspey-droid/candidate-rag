@@ -3,7 +3,9 @@ src/mcp_server.py  -  the candidate-rag search as an MCP server (Model Context P
 
 Any MCP-compatible assistant (the Claude desktop app, Claude Code, MCP Inspector) can connect to it and
 search the candidate pool itself. Built on the official MCP Python SDK, mcp 2.3.0
-(`from mcp.server.mcpserver import MCPServer`), stdio transport.
+(`from mcp.server.mcpserver import MCPServer`). Two transports:
+  * stdio (the default), for a client that launches the server itself, such as the desktop app config;
+  * Streamable HTTP (`--http`, Part 3), for a remote server that clients reach by URL at /mcp.
 
 Exposes (agreed 14/10, see BUILD_LOG.md Part 2, Step 2):
   tool      list_roles          the roles the pool can be searched against
@@ -22,10 +24,22 @@ Rules:
     that looks like "no matches".
   * Logs go to stderr only. On the stdio transport, stdout carries the protocol messages; anything
     else printed there corrupts them.
+  * HTTP mode is stateless with plain JSON replies (no session to lose when a load balancer moves a client
+    between copies), checks the Host and Origin headers itself (binding to 0.0.0.0 switches off the SDK's
+    own check), and only starts listening once the index is open and the model has embedded a query.
 
 Run (from the candidate-rag folder, venv active):
     python src/mcp_server.py                       # sample data; waits for a client on stdin/stdout
     $env:CANDIDATE_RAG_REAL="1"; python src/mcp_server.py   # real data (PowerShell), local only
+    python src/mcp_server.py --http                # sample data over HTTP at http://127.0.0.1:8000/mcp
+
+HTTP settings (environment variables, all optional):
+    MCP_TRANSPORT=http      same as --http
+    MCP_HOST                address to listen on (default 127.0.0.1; 0.0.0.0 inside a container)
+    MCP_PORT                port (default 8000)
+    MCP_ALLOWED_HOSTS       comma-separated public hostnames clients use, e.g. the AWS service's hostname;
+                            localhost and 127.0.0.1 are always allowed
+    MCP_ALLOWED_ORIGINS     comma-separated extra browser origins (claude.ai, claude.com and local ones are allowed)
 """
 
 from __future__ import annotations
@@ -33,6 +47,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, TypedDict
@@ -46,8 +62,11 @@ else:
 os.environ["CANDIDATE_RAG_READONLY"] = "1"
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
-                    format="%(asctime)s %(levelname)s candidate-rag: %(message)s")
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")  # name: ours is candidate-rag
 log = logging.getLogger("candidate-rag")
+# The SDK's HTTP transport logs "Terminating session: None" at INFO on every stateless request (seen 20/10);
+# that would be one useless CloudWatch line per call. Its warnings and errors still show.
+logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pydantic import BaseModel, ConfigDict, Field, StrictBool  # noqa: E402
@@ -55,12 +74,16 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool  # noqa: E402
 from mcp import MCPError  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError  # noqa: E402
+from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
+from starlette.requests import Request  # noqa: E402
+from starlette.responses import JSONResponse  # noqa: E402
 
 from index import load_profiles  # noqa: E402
 from paths import DATA, JDS, SAMPLE  # noqa: E402
 from retrieve import ROLES  # noqa: E402
-from search import SNIPPET_CHARS, IndexNotReady, build_where, hybrid_rank, open_collection, python_filter  # noqa: E402
+from search import (SNIPPET_CHARS, IndexNotReady, QueryEmbedder, build_where, hybrid_rank,  # noqa: E402
+                    open_collection, python_filter)
 
 MAX_RESULTS = 20
 MAX_QUERY_CHARS = 500
@@ -74,6 +97,17 @@ ROLE_SUMMARIES = {
     "semi-senior": ("Semi-senior accountant in practice: accounts preparation, VAT, personal tax and "
                     "bookkeeping. AAT qualified, or studying towards ACA or ACCA."),
 }
+MCP_PATH = "/mcp"
+DEFAULT_PORT = 8000
+LOCAL_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+ALLOWED_ORIGINS = ["https://claude.ai", "https://claude.com",
+                   "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]  # local ones: the Inspector's web UI
+# One search at a time. The SDK runs each tool call on its own worker thread, and every search in progress
+# holds its own working memory (embedding and Chroma query). Measured 20/10 in the container at 0.25 vCPU:
+# idle 109 MB, ten searches at once about 1.1 GB, which crashed the 1 GB container (OOM, exit 137). One at a
+# time, memory stays flat (about 215 MB after 30 searches). On a quarter of a CPU, parallel searches can't
+# finish sooner anyway, so queuing them costs no throughput. Also makes the first index open thread-safe.
+_SEARCH_LOCK = threading.Lock()
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
                             open_world_hint=False)
 
@@ -159,6 +193,14 @@ def _collection():
         raise ToolError(str(e)) from e
 
 
+@lru_cache(maxsize=1)
+def _query_embedder() -> QueryEmbedder:
+    try:
+        return QueryEmbedder()  # same vectors as Chroma's, without padding to 256 tokens (see search.py)
+    except IndexNotReady as e:
+        raise ToolError(str(e)) from e
+
+
 def _role(role: str) -> dict:
     if role not in ROLES:
         raise ToolError(f"Unknown role '{role}'. Known roles: {', '.join(sorted(ROLES))}. Call list_roles.")
@@ -207,19 +249,21 @@ def search_candidates(
     if not q:
         raise ToolError("query is empty. Describe what to look for, e.g. 'credit controller aged debt'.")
     texts, meta = _profiles()
-    col = _collection()
     wanted = filters.model_dump(exclude_none=True) if filters else {}
     where, used = build_where(cfg["area_flag"], wanted)
     pool = {pid for pid, m in meta.items()
             if python_filter(m, cfg["area_flag"]) and all(bool(m.get(k)) == v for k, v in used.items())}
     if not pool:
         raise ToolError(f"No candidates for role '{role}' match the filters {used}. Remove or loosen a filter.")
-    try:
-        ranked = hybrid_rank(col, q, where, texts, pool)[:n_results]
-    except Exception as e:  # anything unanticipated: say what failed instead of the SDK's generic message
-        log.exception("search failed")
-        raise ToolError(f"Search failed ({type(e).__name__}: {str(e)[:200]}). The embedding model (about 80 MB) "
-                        "downloads on the first search on a machine; check the server log.") from e
+    with _SEARCH_LOCK:  # one search at a time: see _SEARCH_LOCK
+        col = _collection()
+        embed = _query_embedder()
+        try:
+            ranked = hybrid_rank(col, q, where, texts, pool, embed=embed)[:n_results]
+        except Exception as e:  # anything unanticipated: say what failed instead of the SDK's generic message
+            log.exception("search failed")
+            raise ToolError(f"Search failed ({type(e).__name__}: {str(e)[:200]}). The embedding model (about 80 MB) "
+                            "downloads on the first search on a machine; check the server log.") from e
     log.info("search_candidates role=%s n=%d filters=%s pool=%d returned=%d", role, n_results, used, len(pool), len(ranked))
     return {"role": role, "query": q, "filters_applied": used, "pool_size": len(pool), "results": [
         {"rank": i, "id": pid, "title": meta[pid].get("current_title") or "", "employer": meta[pid].get("current_company") or "",
@@ -285,13 +329,59 @@ def shortlist_for_role(role: str, how_many: int = 3) -> str:
 """
 
 
+# ---------------------------------------------------------------------------- HTTP transport (Part 3)
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
+    """For the load balancer. Outside the MCP endpoint, so it isn't subject to the Host check: a load
+    balancer's health check names the task's own IP address as the host. The server only starts listening
+    after _warm_up() has succeeded, so any answer at all means the search path is ready."""
+    return JSONResponse({"status": "ok", "mode": MODE})
+
+
+def _host_patterns(extra: str) -> list[str]:
+    """Allowed Host header values: always the local ones, plus each public hostname given (with or without a
+    port; a bare hostname also matches it with any port)."""
+    hosts = list(LOCAL_HOSTS)
+    for h in (x.strip().lower() for x in extra.split(",")):
+        if h and h not in hosts:
+            hosts += [h] if ":" in h else [h, f"{h}:*"]
+    return hosts
+
+
+def http_app(allowed_hosts: str | None = None, allowed_origins: str | None = None):
+    """The Starlette app for the Streamable HTTP transport, built from the same MCPServer as stdio.
+    Stateless: no session is kept between requests, so two copies behind a load balancer (as during a
+    canary deploy) answer any request alike. JSON replies: one plain response per call, no event stream
+    held open through the load balancer."""
+    hosts = _host_patterns(os.environ.get("MCP_ALLOWED_HOSTS", "") if allowed_hosts is None else allowed_hosts)
+    extra = os.environ.get("MCP_ALLOWED_ORIGINS", "") if allowed_origins is None else allowed_origins
+    origins = ALLOWED_ORIGINS + [o.strip() for o in extra.split(",") if o.strip()]
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                                         allowed_hosts=hosts, allowed_origins=origins)
+    return mcp.streamable_http_app(streamable_http_path=MCP_PATH, stateless_http=True, json_response=True,
+                                   transport_security=security)
+
+
+def _warm_up() -> None:
+    """Open the profiles and the index copy and embed one query, so the first real search is fast and a
+    broken image fails here, at start-up, instead of on a user's first call."""
+    t0 = time.monotonic()
+    texts, _ = _profiles()
+    col = _collection()
+    col.query(query_embeddings=[_query_embedder()("warm-up")], n_results=1)  # loads the model; logs no search line
+    log.info("warm: %d profiles, index open, model loaded (%.1f s)", len(texts), time.monotonic() - t0)
+
+
+# ---------------------------------------------------------------------------- shutdown and entry point
 def _stop_now(signum, _frame) -> None:
-    """Ctrl+C (or SIGTERM): exit at once. The SDK's stdio transport reads stdin on a worker thread, so a
-    normal KeyboardInterrupt leaves the process waiting for that thread until stdin closes (measured 14/10:
-    no exit within 10 s of Ctrl+C). A read-only server has nothing to save, so it removes its temporary
-    index copy and exits immediately."""
+    """Ctrl+C, SIGTERM (how ECS stops a task) or, on Windows, Ctrl+Break: clean up and exit at once.
+    stdio: the SDK's stdio transport reads stdin on a worker thread, so a normal KeyboardInterrupt leaves the
+    process waiting for that thread until stdin closes (measured 14/10: no exit within 10 s of Ctrl+C).
+    HTTP: uvicorn catches the signal first, finishes in-flight requests, then re-raises it, which lands
+    here. A read-only server has nothing to save, so it removes its temporary index copy and exits."""
     log.info("stopping (signal %s)", signum)
     _cleanup()
+    log.info("stopped")
     logging.shutdown()
     os._exit(0)
 
@@ -300,20 +390,47 @@ def _cleanup() -> None:
     """Drop the collection, release Chroma's files and delete the temporary index copy."""
     from search import close_temp_copies
     _collection.cache_clear()
+    _query_embedder.cache_clear()
     left = close_temp_copies()
     if left:
         log.warning("could not remove temporary index copy (files still open?): %s", ", ".join(left))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
     import signal
-    signal.signal(signal.SIGINT, _stop_now)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _stop_now)
-    log.info("starting: mode=%s data=%s jds=%s (read-only, stdio)", MODE, DATA, JDS)
-    mcp.run(transport="stdio")  # returns when the client closes stdin
+    parser = argparse.ArgumentParser(description="candidate-rag MCP server (read-only)")
+    parser.add_argument("--http", action="store_true",
+                        help="serve Streamable HTTP at /mcp instead of stdio (or set MCP_TRANSPORT=http)")
+    args = parser.parse_args(argv)
+    http = args.http or os.environ.get("MCP_TRANSPORT", "").strip().lower() == "http"
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):  # SIGBREAK exists on Windows only
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _stop_now)
+
+    if not http:
+        log.info("starting: mode=%s data=%s jds=%s (read-only, stdio)", MODE, DATA, JDS)
+        mcp.run(transport="stdio")  # returns when the client closes stdin
+        _cleanup()
+        log.info("stopped (client closed the connection)")
+        return 0
+
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("MCP_PORT", str(DEFAULT_PORT)))
+    log.info("starting: mode=%s data=%s jds=%s (read-only, streamable HTTP on %s:%d%s, stateless)",
+             MODE, DATA, JDS, host, port, MCP_PATH)
+    log.info("allowed hosts: %s", ", ".join(_host_patterns(os.environ.get("MCP_ALLOWED_HOSTS", ""))))
+    try:
+        _warm_up()
+    except Exception as e:  # missing index, missing profiles, model failure: refuse to start, say why
+        log.error("not starting: %s", e)
+        _cleanup()
+        return 1
+    import uvicorn
+    uvicorn.run(http_app(), host=host, port=port, log_level="info")  # uvicorn handles SIGINT/SIGTERM
     _cleanup()
-    log.info("stopped (client closed the connection)")
+    log.info("stopped")
     return 0
 
 

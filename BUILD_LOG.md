@@ -1170,3 +1170,234 @@ no new files in the clone.
 (Step 6.4, skipped on purpose), the Inspector's browser UI (only its CLI was used), check_guards.py and
 inspector_check.py on the fresh clone (they need the real embedding model download and Node), and the
 server on macOS or Linux through a desktop client.
+
+# Part 3: Remote MCP server on AWS (from 20/10/2026)
+
+Build guide: the "Candidate RAG remote MCP on AWS: build guide" document (20/10/2026). Fabian's brief: a
+remote MCP server on the 22-person sample that an interviewer can add to Claude by URL and try; compare ECS
+Express Mode with Lightsail; avoid IAM Identity Center and AWS Organizations; budget alert before any
+resource; London (eu-west-2); stages: HTTP + Inspector locally, container locally, ECR and deployment,
+CloudWatch logs, GitHub Actions. Same eight working rules as Part 2.
+
+**Decisions taken in the guide:** ECS Express Mode (Lightsail can't use private ECR or CloudWatch, so it
+fails stages 3 and 4); authless on the sample only; Streamable HTTP, stateless, JSON responses; 0.25 vCPU
+and 1 GB (measured about 306 MB with a same-size stand-in model; the real model's download is blocked from
+the build workspace); about $38 a month at US East rates, London to be confirmed in the Pricing Calculator.
+AWS sign-up deferred to just before Step 4, because the six-month free plan starts at sign-up.
+
+**Corrections to the brief, named at the time:** joining AWS Organizations upgrades a free plan account to
+paid, but the docs don't say the credits are removed; Identity Center isn't named as a trigger. App Runner
+closed to new customers is confirmed, but not the 30 April date. The free plan also ends when the credits
+run out, not only after six months.
+
+## Step 1: Windows set-up, WSL 2 and Docker Desktop (20/10)
+
+**Machine check:** Windows 11 Home; 17 GB RAM; virtualisation enabled in firmware; WSL not installed.
+
+**Windows Home and Docker Desktop:** Docker's install page contradicts itself. It lists Enterprise, Pro
+and Education as supported, but also says "Windows Home or Education editions only allow you to run Linux
+containers", which implies Home works for Linux containers, the only kind this build uses. Decision:
+install and let the Step 1 checks decide; fallback if Docker Desktop won't run is Docker Engine inside a
+WSL Ubuntu distribution, which doesn't depend on the Windows edition.
+
+**Build 26200 (Windows 11 25H2), WSL 3.0.3.0 installed, but WSL 2 couldn't start:** "virtualization is
+not enabled". Firmware virtualisation was already True, so the BIOS was ruled out; HypervisorPresent was
+False. Checked rather than guessed: in an elevated window VirtualMachinePlatform showed Disabled. The first
+install had run in a non-admin window (the feature query also failed there with "requires elevation"), so
+only the WSL package got installed, not the Windows component. `wsl --install --no-distribution` as
+administrator enabled it ("Changes will not be effective until the system is rebooted"). My mistake on the
+way: the first feature query passed two names to -FeatureName, which takes one.
+After the restart: `wsl --status` shows Default Version 2 with no virtualisation error; HypervisorPresent
+True. WSL 2 is working. (The WSL1 message remains and doesn't matter; only WSL 2 is used.)
+
+**Docker Desktop installed on Windows 11 Home (20/10):** Docker Desktop 4.96.0, engine 29.9.1,
+context desktop-linux; Server section present with OS/Arch linux/amd64. `hello-world` printed "Hello from
+Docker!". `python:3.13-slim` printed `x86_64 3.13.16` (image digest sha256:70729b46c69b4f1e97c4822c1af3df5
+3a1476cf5ddc6c087c0c10bc3a5678c2f, the candidate to pin in the Dockerfile). The Windows Home question is
+settled for this build: Linux containers run, so the Docker Engine-in-WSL fallback isn't needed.
+
+**Step 1 status:** everything identified is done. Not exercised: building our own image (Step 3).
+
+## Step 2: HTTP transport, locally and in MCP Inspector (20/10)
+
+**How files reach the project from now on:** Fabian chose option A at 17:29. The chat is linked to his PC
+and the candidate-rag folder is connected, so files are written straight into it; no more downloading and
+moving. The folder also holds data/, chroma/ and .env; the rule is that they are never read or staged, and
+only named files are written or read back.
+
+**What changed:**
+- `src/mcp_server.py`: `--http` (or MCP_TRANSPORT=http) serves Streamable HTTP at /mcp; stdio stays the
+  default, so the desktop config is untouched. Stateless, JSON replies. Host check passed explicitly
+  (localhost always, plus MCP_ALLOWED_HOSTS); origins claude.ai, claude.com and local ones (the
+  Inspector's web UI). `GET /health` outside the Host check. Warm-up (profiles, index copy, one embedded
+  query) runs *before* the server starts listening, and a failed warm-up exits with code 1.
+  Signal handler now also covers SIGBREAK (Windows Ctrl+Break).
+- `tests/test_http.py`: 8 tests through Starlette's test client (health with an IP Host header, 421 for a
+  wrong host, 403 for a foreign origin, a stateless call with no session id, the same tools/resource/prompt
+  as stdio, guards over HTTP, the host-pattern helper). No search, so no index or model needed.
+- `tools/check_http.py`: 11 checks against a real server process it starts and stops itself, or against a
+  running one with `--url` (Steps 3 and 4).
+- `tools/inspector_check.py`: `--http URL` runs the same 12 checks over Streamable HTTP.
+
+**Change from the guide, decided while building:** the guide said /health returns 503 during start-up.
+Instead the server doesn't listen until warm-up has finished. Reason: a 503 phase needs the warm-up on a
+second thread while requests are already arriving, so two requests could each open their own index copy
+(the collection cache isn't safe across threads). Not listening is simpler and the load balancer treats it
+the same way (unhealthy until it answers). The check is now "nothing listening, then 200, with 'warm:'
+logged before 'Uvicorn running'".
+
+**Found while testing:** the SDK's HTTP transport logs "Terminating session: None" at INFO for every
+stateless request, which would be one useless CloudWatch line per call; its logger is set to WARNING.
+The log format also hard-coded "candidate-rag:" for every logger, so SDK lines looked like ours; it now
+prints each logger's own name (ours is still candidate-rag).
+
+**Checked in the build workspace before handing over** (Linux, Python 3.13, with a stand-in for the
+embedding model laid out the way Chroma expects, because the real download is blocked there):
+pytest 40 passed (32 + 8); check_http 11/11 (ready after 2.2 s, nothing listening before warm-up, 421, 403,
+stateless, search, guards, 10 parallel searches, SIGTERM exit 0 in 0.3 s, no copy left); inspector_check
+--http 12/12 including --strict; inspector_check (stdio) 12/12; check_guards 20/20. Mutation check:
+switching the host protection off makes the 421 and 403 tests fail.
+
+**Not yet exercised:** any of this on Windows, with the real model; Ctrl+Break as the stop signal (Windows
+has no SIGTERM for a child process).
+
+**Fabian's run on Windows with the real model (17:43 to 17:45):** pytest 40 passed. check_http 11/11:
+ready after 3.7 s with one earlier attempt finding nothing listening and 'warm:' logged before 'Uvicorn
+running'; 421 for another host; 403 for a foreign origin and 200 for claude.ai; stateless call, no session
+header; search, get_profile and guards over HTTP; 10 parallel searches in 3.0 s; **Ctrl+Break stop: exit
+code 0 after 0.2 s, 'stopped' logged, no temporary copy left**. check_guards 20/20 and inspector_check
+(stdio) 12/12, so stdio is unchanged. Manual run: warm-up 0.6 s; inspector_check --http 12/12 including
+--strict; Ctrl+C gave "stopping (signal 2)" then "stopped". The real model ranks the same five semi-seniors
+in the same order over stdio and over HTTP (10, 21, 11, 16, 13).
+
+Seen in the server output: the Inspector opens a GET /mcp stream after each initialise (200), harmless in
+stateless mode; uvicorn logs one access line per request and the SDK logs rejected tool arguments at INFO,
+both useful in CloudWatch.
+
+**Step 2 status:** everything identified is done. Not exercised: a load balancer, HTTPS, and SIGTERM on
+Linux (Windows used Ctrl+Break and Ctrl+C); those come in Steps 3 and 4.
+
+## Step 3: The container, running locally (20/10)
+
+**New files:**
+- `requirements-server.txt`: the full dependency set for the image, 93 packages, generated by installing
+  chromadb==1.5.9 and mcp==2.3.0 into a clean Linux Python 3.13 venv and running `pip freeze`, so every
+  build installs the same versions. No anthropic, no pytest. python-dotenv appears because chromadb
+  depends on it; the server never reads .env and the build never sees it.
+- `Dockerfile`: python:3.13-slim pinned by the digest pulled in Step 1; dependencies in their own layer;
+  the model downloaded and the sample index built at build time, as root, then made read-only for the run
+  user; HOME fixed at /opt/candidate-rag-home so the build-time model is the run-time model; user 10001,
+  no home, no login shell; ANONYMIZED_TELEMETRY=False; MCP_TRANSPORT=http, MCP_HOST=0.0.0.0, port 8000;
+  CMD in exec form so SIGTERM reaches Python directly.
+- `.dockerignore`: an allowlist. `*`, then only requirements-server.txt, five server source files
+  (mcp_server, search, paths, index, retrieve), sample/profiles.jsonl and sample/jds/. The Part 1 scripts
+  that call Claude or read the source database aren't in the image at all.
+- `tools/check_container.py`: 11 checks on the image and on a container run read-only with the Fargate
+  limits; reuses check_http.py (--url) and inspector_check.py (--http). GitHub Actions will run it in Step 6.
+
+**Checked in the build workspace before handing over.** Docker Hub is blocked from there, so the build used
+a stand-in Python 3.13 base assembled from the workspace's own Python (only the FROM line changed), and the
+stand-in embedding model. Planted a fake data/profiles.jsonl, a fake .env and a jds/ file in the build
+copy to test the allowlist. Results: image 810 MB (with the stand-in base); 11/11 checks: user 10001; no
+real-data switch; exactly the 9 allowlisted files plus 5 sample-index files; none of data/, jds/,
+chroma/, .env, .git, .venv; no anthropic; healthy after 6.7 s with --read-only --tmpfs /tmp, 1 GB, 0.25
+vCPU; check_http 10/10 against it; Inspector 12/12 against it; docker diff empty; docker stop exit 0 in
+0.7 s with 'stopped' logged. Memory 101 MiB, which means nothing with a stand-in model.
+
+Found while building there, both from the stand-in base, not the Dockerfile: missing system libraries
+(libpthread), and useradd not on PATH. The real python:3.13-slim has both.
+
+**Not yet exercised:** the real base image and the real model, so the real image size and memory.
+
+**Fabian's first run on Windows (18:07):** build 80.8 s; image 1.16 GB on disk, 341 MB content (compressed).
+check_container at 1 GB: 10/11. Image checks all passed; healthy after 23.0 s at 0.25 vCPU; Inspector 12/12;
+docker stop exit 0 in 0.9 s, not OOM-killed. **check_http failed**: its output stopped after the guards
+check, with no summary, so it crashed during "10 searches at once", and check_container hid the error. At
+512 MB: also check_http crashed, and Inspector 7/12.
+
+**Queried before proposing a cause (rule 2).** Reproduced in the build workspace with a stand-in model
+that has the real model's size *and* compute (6 layers, 30,522 x 384 embeddings), container at 1 GB and
+0.25 vCPU: the same crash, as "Server disconnected without sending a response", and here the container
+was **OOM-killed (exit 137) at 1 GB**. Measured without a limit: idle 109 MiB, ten searches at once about
+1.1 GiB, falling back afterwards. Isolated it in-process:
+- ONNX Runtime alone, ten concurrent runs: +30 MB. Not the cause.
+- Chroma embedding x10 concurrent: +217 MB; query x10: +345 MB; full hybrid search x10: +330 MB.
+- The same searches one after another, same thread or new threads: flat (179 to 215 MB after 30).
+So the cost is concurrency: each search in progress holds its own working memory, and the SDK runs every
+tool call on its own worker thread (anyio.to_thread, checked in the SDK source).
+
+**Fix, at the source (rule 4):**
+1. `src/mcp_server.py`: a lock so one search runs at a time (also makes the first index open thread-safe).
+   On 0.25 vCPU parallel searches can't finish sooner anyway, so queuing costs no throughput. With the
+   lock alone, 20 queued searches still peaked at 755 MiB: glibc gives each worker thread its own memory
+   arena and keeps what it frees.
+2. `Dockerfile`: MALLOC_ARENA_MAX=2. With both: 20 queued searches peaked at 286 MiB, all answered, slowest
+   21.2 s (each search about 1 s at a quarter of a CPU). With arenas capped and no lock, the in-process
+   burst still reached 669 MB, so both are needed.
+- `tests/test_mcp_server.py`: new test that six concurrent searches never overlap. Mutation check:
+  without the lock it fails ("assert 4 == 1"). pytest now 41.
+- `tools/check_http.py`: the parallel-search check reports a dropped connection as a failure instead of
+  crashing the script.
+- `tools/check_container.py`: prints the failing lines and the error output of a sub-check, and samples
+  memory every half second for the whole run, so it reports the *peak* and any OOM kill, not the level
+  afterwards (the first version would have missed this).
+
+**Rechecked in the workspace with the realistic stand-in model:** check_container 11/11 at 1 GB (peak 256
+MiB) and 11/11 at 512 MB (peak 283 MiB), never OOM-killed; check_http 10/10 and Inspector 12/12 against
+the container at both sizes.
+
+**Size decision:** stays at 1 GB. 512 MB now passes too, but with about 230 MB of headroom against a
+measured peak, and an out-of-memory kill gives no useful error; 1 GB costs about $1.60 a month more.
+
+**Fabian's rerun on Windows (21/10, 10:26):** pytest 41 passed. Build 79.8 s. check_container at 1 GB:
+10/11, **peak memory 273 MiB over 64 samples, never OOM-killed** (the fix worked); at 512 MB: 10/11, peak 243
+MiB. Both: healthy after about 18 s, Inspector 12/12, docker stop exit 0. **Still failing: "10 searches at
+once"**, at both sizes, and check_container printed only the check's name, not its detail line, so the
+cause isn't visible. Not guessing: check_http now times the single search and every one of the ten (each
+one's wait, and any error such as a timeout), and check_container prints the failing check's detail line.
+The 60 s per-request timeout in that check is the obvious suspect if each search on this laptop's quarter
+CPU takes several seconds (healthy took 18 s here against 6.5 s in the build workspace), but that's to be
+measured, not assumed.
+
+**The detail (21/10, 10:33):** "6/10 in 60.9 s; each waited 12.7 to 60.9 s; errors: ReadTimeout". Memory
+peak 366 MiB, never OOM-killed. So nothing crashed: searches were queued as designed, but each took roughly
+10 s on this laptop's quarter CPU, and the last four passed the check's 60 s per-request limit. That's not
+only a test problem: a demo where Claude runs four searches would take 40 s.
+
+**Measured where the time goes, inside the container at 0.25 vCPU (build workspace):** embed the query 1.0 s;
+query the index by vector 0.02 s; BM25 0.0003 s; whole search 1.0 s. The query embedding is the entire cost.
+Two causes, each measured: Chroma pads every input to 256 tokens (a 12-token query embeds in 0.04 s instead of
+0.28 s), and ONNX Runtime starts one thread per host core, which then fight over a quarter of a CPU (one
+thread: 0.18 s against 0.28 s even on this 2-core workspace; worse on a laptop with many cores).
+
+**Fix at the source:** `src/search.py` gains QueryEmbedder: the same model file, tokenizer, truncation at 256,
+mean pooling and normalisation as Chroma's default embedding function (copied step for step from chromadb
+1.5.9), but no padding and one ONNX thread. `hybrid_rank` takes it as an optional `embed`; without it nothing
+changes, so retrieve.py and the Part 1 agent behave exactly as before. The server uses it for searches and the
+warm-up, so Chroma's own model session is never loaded at run time.
+
+**Equivalence is measured, not assumed:** new `tools/check_query_embedding.py` compares QueryEmbedder with
+Chroma's function on 34 inputs (10 queries, all 22 profiles, both adverts, which run past 256 tokens) and
+requires cosine similarity of at least 0.99999; then checks that the semantic ranking of each whole pool and
+the hybrid ranking search_candidates returns are identical for every query and role (20 each); and times both.
+In the workspace it passes 3/3, but there the stand-in model ignores attention, so that only proves the
+script works; the real proof is Fabian's run with the real model.
+
+**Results in the workspace (realistic-cost stand-in, 0.25 vCPU):** full search 0.038 s each, against 1.0 s
+before; check_container 11/11, peak memory 206 MiB. pytest 41 passed (the server tests give the server the
+same stand-in for queries as for the index, so they still need no model download). The one-search-at-a-time
+lock and MALLOC_ARENA_MAX=2 stay: cheap, and they still bound memory if traffic arrives together.
+
+**Fabian's run with the real model (21/10, 11:02):** pytest 41 passed. **check_query_embedding 3/3: lowest
+cosine similarity 1.00000000, largest difference in any dimension 0.00e+00** (bit-for-bit the same vectors as
+Chroma's, on all 34 inputs including both adverts past 256 tokens); semantic and hybrid rankings identical
+20 of 20; query embedding on the laptop, unrestricted, 24 ms with Chroma's function against 4.3 ms. Rebuild
+23.6 s (dependency layer cached). check_container 11/11 at 1 GB / 0.25 vCPU: healthy after 13.1 s; check_http
+10/10 including the ten searches at once; Inspector 12/12; **peak memory 209 MiB**; docker diff empty; docker
+stop exit 0 in 0.8 s.
+
+**Step 3 status:** everything identified is done. Image: 1.16 GB on disk, 341 MB compressed content. Size
+stays 0.25 vCPU / 1 GB. Not exercised: Fargate's own hardware and network, pulling the image from a registry,
+and an explicit check that search lines reach `docker logs` (the start-up and "stopped" lines do, which is
+the same stream; Step 5 checks search lines in CloudWatch). The 512 MB comparison was last run before the
+speed fix (peak 243 MiB then).

@@ -6,6 +6,7 @@ The index is a throwaway copy of the invented sample, embedded with a tiny deter
 real model, so these tests check the MCP layer and its guards, not search quality (Part 1 measured that).
 """
 import asyncio
+import functools
 import hashlib
 import json
 import re
@@ -43,6 +44,16 @@ import index  # noqa: E402
 import mcp_server  # noqa: E402
 import search  # noqa: E402
 from conftest import TEST_INDEX_DIR  # noqa: E402
+
+
+@functools.lru_cache(maxsize=1)
+def _stand_in_query_embedder():
+    """The server embeds queries with its own QueryEmbedder (Part 3); here it gets the same stand-in as the
+    index, so these tests still need no model download."""
+    return lambda text: [float(x) for x in _stand_in_embedder(None, [text])[0]]
+
+
+mcp_server._query_embedder = _stand_in_query_embedder
 
 SAMPLE = ROOT / "sample"
 PROFILES = [json.loads(line) for line in (SAMPLE / "profiles.jsonl").open(encoding="utf-8") if line.strip()]
@@ -202,3 +213,32 @@ def test_read_only_sample_and_index_unchanged_by_a_session():
     run(body)
     assert fingerprint(SAMPLE) == before_sample
     assert fingerprint(Path(TEST_INDEX_DIR)) == before_index
+
+
+def test_searches_run_one_at_a_time(monkeypatch):
+    """Parallel searches each hold their own working memory; ten at once crashed the 1 GB container on 20/10
+    (OOM). The server queues them. This fails if the lock around the search is removed."""
+    import threading
+    import time as _time
+    active, peak, guard = [0], [0], threading.Lock()
+    real = mcp_server.hybrid_rank
+
+    def counting(*a, **k):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        _time.sleep(0.05)
+        try:
+            return real(*a, **k)
+        finally:
+            with guard:
+                active[0] -= 1
+    monkeypatch.setattr(mcp_server, "hybrid_rank", counting)
+
+    async def body(c):
+        import asyncio as _asyncio
+        return await _asyncio.gather(*[c.call_tool("search_candidates", {"role": "semi-senior", "query": f"accountant {i}",
+                                                                         "n_results": 3}) for i in range(6)])
+    results = run(body)
+    assert all(not r.is_error for r in results)
+    assert peak[0] == 1

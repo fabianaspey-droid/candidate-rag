@@ -11,6 +11,8 @@ comparing retrieval output byte for byte before and after). Nothing here writes 
   embed_rank          semantic ranking (what the Step 7 agent uses)
   bm25, rrf           keyword ranking and reciprocal rank fusion
   hybrid_rank         semantic + BM25 fused, for a free-text query (new; for the MCP server)
+  QueryEmbedder       embeds one search query the way Chroma does, minus the padding to 256 tokens and with
+                      one ONNX thread (Part 3, 21/10: the query embedding was the whole cost of a search)
 """
 
 from __future__ import annotations
@@ -92,12 +94,18 @@ def build_where(area_flag: str, filters: dict | None = None) -> tuple[dict, dict
     return (clauses[0] if len(clauses) == 1 else {"$and": clauses}), used
 
 
-def hybrid_rank(col, query: str, where: dict, texts: dict[str, str], pool: set[str]) -> list[tuple[str, float]]:
+def hybrid_rank(col, query: str, where: dict, texts: dict[str, str], pool: set[str],
+                embed=None) -> list[tuple[str, float]]:
     """Semantic ranking over the whole filtered pool, fused with BM25 over the same pool (one vote
-    each, RRF). The same fusion retrieve.py uses for hybrid_rrf, applied to a free-text query."""
+    each, RRF). The same fusion retrieve.py uses for hybrid_rrf, applied to a free-text query.
+    embed: optional function text -> vector (a QueryEmbedder). Without it, Chroma embeds the query itself."""
     if not pool:
         return []
-    semantic = [pid for pid, _ in embed_rank(col, query, where, len(pool))]
+    if embed is None:
+        semantic = [pid for pid, _ in embed_rank(col, query, where, len(pool))]
+    else:
+        res = col.query(query_embeddings=[embed(query)], n_results=len(pool), where=where, include=["distances"])
+        semantic = list(res["ids"][0])
     keyword = [pid for pid, _ in bm25(query, texts, pool)]
     return rrf([semantic, keyword])
 
@@ -130,6 +138,57 @@ def close_temp_copies() -> list[str]:
 
 class IndexNotReady(RuntimeError):
     pass
+
+
+class QueryEmbedder:
+    """Embeds one search query with the same model file, tokenizer, mean pooling and normalisation that
+    Chroma's default embedding function used for the stored profiles, with two differences:
+
+    * no padding to 256 tokens. Chroma pads every input to 256 tokens; for a query of a few words that is
+      almost all wasted work. The model masks padding out of attention and the pooling ignores it, so the
+      vector is the same (tools/check_query_embedding.py measures the difference with the real model).
+    * one ONNX Runtime thread. By default it starts a thread per CPU core it can see, and a container limited
+      to a quarter of a CPU still sees every core of the host, so those threads fight over the quarter.
+
+    Measured 21/10 in the container at 0.25 vCPU: embedding the query was 1.0 s of a 1.0 s search (the index
+    search 0.02 s, BM25 0.0003 s). On Fabian's laptop a search took about 10 s.
+    """
+
+    def __init__(self):
+        import os
+
+        import numpy as np
+        import onnxruntime as ort
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+        from tokenizers import Tokenizer
+        folder = os.path.join(ONNXMiniLM_L6_V2.DOWNLOAD_PATH, ONNXMiniLM_L6_V2.EXTRACTED_FOLDER_NAME)
+        model, vocab = os.path.join(folder, "model.onnx"), os.path.join(folder, "tokenizer.json")
+        if not (os.path.isfile(model) and os.path.isfile(vocab)):
+            raise IndexNotReady(f"The embedding model isn't downloaded ({folder}). Run: python src/index.py --sample")
+        self.np = np
+        self.tokenizer = Tokenizer.from_file(vocab)
+        self.tokenizer.enable_truncation(max_length=256)  # the same limit Chroma applies
+        self.tokenizer.no_padding()
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.log_severity_level = 3
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL  # as Chroma sets it
+        self.session = ort.InferenceSession(model, sess_options=opts, providers=["CPUExecutionProvider"])
+
+    def __call__(self, text: str) -> list[float]:
+        np = self.np
+        enc = self.tokenizer.encode(text)
+        ids = np.array([enc.ids], dtype=np.int64)
+        mask = np.array([enc.attention_mask], dtype=np.int64)
+        hidden = self.session.run(None, {"input_ids": ids, "attention_mask": mask,
+                                         "token_type_ids": np.zeros_like(ids)})[0]
+        # Chroma's pooling and normalisation, step for step (onnx_mini_lm_l6_v2.py, chromadb 1.5.9)
+        expanded = np.broadcast_to(np.expand_dims(mask, -1), hidden.shape)
+        pooled = np.sum(hidden * expanded, 1) / np.clip(expanded.sum(1), a_min=1e-9, a_max=None)
+        norm = np.linalg.norm(pooled, axis=1)
+        norm[norm == 0] = 1e-12
+        return (pooled / norm[:, np.newaxis]).astype(np.float32)[0].tolist()
 
 
 _TEMP_COPIES: list = []  # kept alive for the life of the process, removed at exit
