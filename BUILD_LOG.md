@@ -1787,3 +1787,46 @@ the variable. README and the `github` command's description say this plainly.
 
 Nothing was created in AWS (the first call was refused). The `production` environment and the AWS_ROLE_ARN
 secret in GitHub are not needed now.
+
+**First pipeline run (21/10, about 16:31 to 16:33), on GitHub's runner:** `test` green: Unit tests "42 passed";
+Container checks "11 of 11 container checks passed" (the image's user and contents, a container under the
+Fargate limits with a read-only filesystem, check_http.py, the 12 Inspector checks on Node 24, peak memory,
+nothing written, clean stop on SIGTERM). `deploy` skipped, as set. So the checks that ran on Fabian's laptop
+also pass on a clean Linux machine built only from the public repository.
+
+**Step 6 status:** everything identified is done, apart from what the account blocks. Not exercised: the deploy
+job (off; its OIDC subject and IAM permissions are unproven until an account allows the identity provider); a
+pull request run (the workflow runs on them; none opened yet).
+
+## Teardown (21/10, 16:45 to 16:55)
+
+Fabian asked whether a live, usable server was worth keeping for the project section. Agreed not 24/7: the
+live URL is deliberately not in the repository, so the GitHub link never leads to it anyway; at about US$40 a
+month the credits would last roughly two and a half months, and a Free plan account closes when they run out.
+The evidence lives in this log. CV wording suggested: deployed to AWS (ECS Express Mode, Fargate) as a remote
+MCP server, live demo on request. Recreate the day before a technical interview: `create` (about 10 minutes,
+new URL), then update the claude.ai connector.
+
+He also asked whether the 14-day log retention was a problem: no. The results that matter are written here;
+the logs hold only health checks, request lines and counts, never caller text; nothing new is written with the
+service gone.
+
+- Step 6 (CI, deploy job off) committed and pushed: commit 169ba13.
+- `delete`: confirmed by typing the service name; "service fully deleted" after about 8 minutes of draining;
+  "load balancers left in eu-north-1: 0". This exercised the fixed `delete` (it waits for the drain) for the
+  first time.
+- `status`: "service candidate-rag-mcp: none (no charge)".
+- Left in place, on purpose: the ECR repository (3 images at most, pennies a month), the IAM roles (free), the
+  two log groups (emptying over 14 days). The claude.ai connector for the old URL should be removed.
+
+## Part 3 status (21/10)
+
+Everything identified is done, apart from what the account blocks. Built and checked: the HTTP transport, the
+container, the deployment on ECS Express Mode, the claude.ai connector with no sign-in, the CloudWatch logs, and
+the CI pipeline on GitHub Actions.
+
+Not exercised: the pipeline's deploy job (the Free plan's service control policy denies GitHub's identity
+provider, so its OIDC subject and IAM permissions are unproven); the spend over a full day (check Billing >
+Credits tomorrow against about US$1.33 for the hours it ran); a pull-request run of the pipeline; a log line
+from a real crash; the three high-severity findings in the base image (glibc, zlib), to clear by moving to a
+newer python:3.13-slim digest before the next deploy.
