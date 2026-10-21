@@ -1492,3 +1492,22 @@ whether this account type allows Fargate and a load balancer at all.
 **Exercised in the build workspace against a fake AWS CLI and fake Docker** (no real AWS reachable there):
 every command's path, reruns skipping what exists, push refusing a dirty tree, the update payload keeping
 awsLogsConfiguration, delete refusing a wrong name. That proves the script's logic, not AWS's behaviour.
+
+**Fabian's run (21/10, 14:29):** check_public CLEAN (43 files); commit 5634fe9, 6 files. `check`: assumed role
+AccountFullAccessRole, eu-north-1, **default VPC with 3 public subnets in 3 zones**, nothing created yet,
+local image present. `roles`: both created, each with its managed policy. `repo`: created, immutable tags,
+scan on push, lifecycle policy set. `push`: the build was fully cached and tagged with the commit, then
+**`docker login` failed: "error storing credentials - err: exit status 1, out: The stub received bad data."**
+Nothing was uploaded.
+
+**Cause, checked rather than guessed:** a known Windows limitation (aws/aws-cli issue 5636). Docker on Windows
+stores registry logins in Windows Credential Manager, which holds secrets of about 2,500 characters; ECR's
+login token is longer for temporary role sessions, which is exactly what `aws login` gives
+(AccountFullAccessRole). AWS's own answer there: no fix in the CLI. Workarounds listed include removing
+Docker's credential store, which would leave logins in plain text permanently.
+
+**Fix:** `push` now logs in and pushes with a throwaway Docker settings folder (DOCKER_CONFIG) that has no
+credential store, deleted as soon as the push ends, so the 12-hour token never lands anywhere permanent and
+Fabian's normal Docker settings are untouched. DOCKER_HOST is set to Docker Desktop's current engine, which
+would otherwise be lost along with the default settings folder. Tested against the fake Docker: both login
+and push saw the temporary folder and the Desktop engine, and no folder was left behind.

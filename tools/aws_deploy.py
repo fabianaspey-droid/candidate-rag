@@ -60,8 +60,8 @@ def aws(*args: str, check: bool = True, region: bool = True) -> dict | list | st
     return json.loads(out) if out.startswith(("{", "[")) else out
 
 
-def run(cmd: list[str], input_text: str | None = None) -> None:
-    r = subprocess.run(cmd, input=input_text, text=True, encoding="utf-8", errors="replace")
+def run(cmd: list[str], input_text: str | None = None, env: dict | None = None) -> None:
+    r = subprocess.run(cmd, input=input_text, text=True, encoding="utf-8", errors="replace", env=env)
     if r.returncode != 0:
         say("FAIL", " ".join(cmd[:3]) + f" exited with {r.returncode}")
         sys.exit(1)
@@ -176,10 +176,21 @@ def cmd_push() -> None:
         return
     say("INFO", f"building from commit {tag}")
     run(["docker", "build", "-t", f"candidate-rag-mcp:{tag}", "-t", image, str(PROJECT)])
-    password = aws("ecr", "get-login-password")
-    run(["docker", "login", "--username", "AWS", "--password-stdin", registry()], input_text=password)
-    run(["docker", "push", image])
-    say("OK", f"pushed {REPO}:{tag}")
+    # Log in and push with a throwaway Docker settings folder that has no credential store. On Windows,
+    # Docker keeps logins in Windows Credential Manager, which holds about 2,500 characters, and ECR's token
+    # for a temporary role session (what `aws login` gives) is longer: "error storing credentials ... The
+    # stub received bad data" (21/10; aws/aws-cli issue 5636). The token lives only in this folder, only for
+    # the push, and the folder is deleted afterwards. DOCKER_HOST keeps Docker Desktop's current engine,
+    # which would otherwise be lost with the default settings folder.
+    engine = subprocess.run(["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+                            capture_output=True, text=True).stdout.strip()
+    with tempfile.TemporaryDirectory(prefix="candidate_rag_docker_") as cfg:
+        (Path(cfg) / "config.json").write_text('{"auths": {}}', encoding="utf-8")
+        env = dict(os.environ, DOCKER_CONFIG=cfg, **({"DOCKER_HOST": engine} if engine else {}))
+        password = aws("ecr", "get-login-password")
+        run(["docker", "login", "--username", "AWS", "--password-stdin", registry()], input_text=password, env=env)
+        run(["docker", "push", image], env=env)
+    say("OK", f"pushed {REPO}:{tag} (the temporary login was deleted with its folder)")
     say("INFO", "waiting for the vulnerability scan (usually under a minute)")
     aws("ecr", "wait", "image-scan-complete", "--repository-name", REPO, "--image-id", f"imageTag={tag}", check=False)
     found = aws("ecr", "describe-image-scan-findings", "--repository-name", REPO, "--image-id", f"imageTag={tag}",
