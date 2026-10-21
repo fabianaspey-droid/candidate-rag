@@ -175,7 +175,12 @@ def cmd_push() -> None:
         say("SKIP", f"image for commit {tag} is already in ECR")
         return
     say("INFO", f"building from commit {tag}")
-    run(["docker", "build", "-t", f"candidate-rag-mcp:{tag}", "-t", image, str(PROJECT)])
+    # --provenance=false --sbom=false: by default Docker Desktop's builder wraps the image in an image index
+    # with an attestation manifest ("exporting attestation manifest", "exporting manifest list"). The tag
+    # then points at the index, which ECR's basic scan doesn't scan: on 21/10 the first push reported
+    # "ScanNotFoundException ... Image scan does not exist". One plain image is scanned on push.
+    run(["docker", "build", "--provenance=false", "--sbom=false",
+         "-t", f"candidate-rag-mcp:{tag}", "-t", image, str(PROJECT)])
     # Log in and push with a throwaway Docker settings folder that has no credential store. On Windows,
     # Docker keeps logins in Windows Credential Manager, which holds about 2,500 characters, and ECR's token
     # for a temporary role session (what `aws login` gives) is longer: "error storing credentials ... The
@@ -199,9 +204,14 @@ def cmd_push() -> None:
     aws("ecr", "wait", "image-scan-complete", "--repository-name", REPO, "--image-id", f"imageTag={tag}", check=False)
     found = aws("ecr", "describe-image-scan-findings", "--repository-name", REPO, "--image-id", f"imageTag={tag}",
                 check=False)
+    status = ((found or {}).get("imageScanStatus") or {}).get("status")
+    if status != "COMPLETE":  # the first version reported a scan that never ran as "none" (21/10)
+        say("FAIL", f"scan did not complete (status: {status or 'no scan found'}); don't `create` until it does")
+        sys.exit(1)
     counts = ((found or {}).get("imageScanFindings") or {}).get("findingSeverityCounts") or {}
     say("OK" if not counts.get("CRITICAL") else "WARN",
-        f"scan findings by severity: {counts or 'none'}" + ("  (critical: review before `create`)" if counts.get("CRITICAL") else ""))
+        f"scan COMPLETE; findings by severity: {counts or 'none found'}"
+        + ("  (critical: review before `create`)" if counts.get("CRITICAL") else ""))
 
 
 def wait_until(predicate, what: str, minutes: int = 15, every: int = 15):

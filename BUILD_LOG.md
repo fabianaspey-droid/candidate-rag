@@ -1525,3 +1525,22 @@ DetectDefaultStore returns "wincred" whenever docker-credential-wincred is on PA
 no default store is detected, and the login is written to the temporary folder, deleted after the push.
 Tested against a fake Docker that applies the same rule: the previous version fails with the same message,
 the new one logs in and pushes.
+
+**Push succeeded (21/10, 14:34):** commit d33cc2a; image `candidate-rag-mcp:d33cc2a2cf39` pushed to ECR in
+Stockholm, 12 layers, digest sha256:bf1fb564... Docker printed its standard warning that the login was
+stored unencrypted in the temporary folder's config.json, which is what the fix intends: that folder is
+deleted when the push ends. Scan result reported as "none". Not yet confirmed: whether "none" means a
+completed scan with no findings, or a scan that didn't run (Docker Desktop pushes an image index with an
+attestation manifest, which basic scanning may not handle); checking the scan status before `create`.
+
+**The scan never ran (14:35):** `describe-image-scan-findings` for tag d33cc2a2cf39 returned
+"ScanNotFoundException ... Image scan does not exist". The temporary Docker folder was gone, as intended.
+Cause, from the build output itself: "exporting attestation manifest" and "exporting manifest list". Docker
+Desktop's builder wraps the image in an image index with a provenance attestation by default, the tag points
+at the index, and ECR's basic scan-on-push doesn't scan an index. The helper had printed this as "findings:
+none", which was misleading: a scan that didn't run looked like a clean one.
+
+**Fix:** `push` builds with `--provenance=false --sbom=false`, so one plain image is pushed and scanned; and
+it now reads the scan *status*, stops with FAIL unless it is COMPLETE, and only then reports the findings.
+Tested against the fake AWS: a completed scan reports its findings; no scan stops with FAIL. The image
+already in ECR (d33cc2a2cf39, an index) stays until the lifecycle rule removes it; nothing will run it.
