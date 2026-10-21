@@ -197,14 +197,15 @@ def cmd_repo() -> None:
 
 
 def cmd_push() -> None:
-    if git("status", "--porcelain", "--untracked-files=no"):
-        say("FAIL", "uncommitted changes. Commit first, so the image's tag names the exact code inside it.")
-        sys.exit(1)
     tag = git("rev-parse", "--short=12", "HEAD")
     image = f"{registry()}/{REPO}:{tag}"
     if aws("ecr", "describe-images", "--repository-name", REPO, "--image-ids", f"imageTag={tag}", check=False):
-        say("SKIP", f"image for commit {tag} is already in ECR")
+        say("SKIP", f"image for commit {tag} is already in ECR; checking its scan")
+        report_scan(tag)
         return
+    if git("status", "--porcelain", "--untracked-files=no"):
+        say("FAIL", "uncommitted changes. Commit first, so the image's tag names the exact code inside it.")
+        sys.exit(1)
     say("INFO", f"building from commit {tag}")
     # --provenance=false --sbom=false: by default Docker Desktop's builder wraps the image in an image index
     # with an attestation manifest ("exporting attestation manifest", "exporting manifest list"). The tag
@@ -231,13 +232,25 @@ def cmd_push() -> None:
         run(["docker", "login", "--username", "AWS", "--password-stdin", registry()], input_text=password, env=env)
         run(["docker", "push", image], env=env)
     say("OK", f"pushed {REPO}:{tag} (the temporary login was deleted with its folder)")
+    report_scan(tag)
+
+
+def report_scan(tag: str) -> None:
+    """Waits for ECR's scan on push and prints the findings. Polls rather than using `aws ecr wait
+    image-scan-complete`: that waiter gives up at once if the scan hasn't been registered yet, which on 21/10
+    (second push, commit 1f3c324) reported "no scan found" seconds after a push that was scanned normally."""
     say("INFO", "waiting for the vulnerability scan (usually under a minute)")
-    aws("ecr", "wait", "image-scan-complete", "--repository-name", REPO, "--image-id", f"imageTag={tag}", check=False)
-    found = aws("ecr", "describe-image-scan-findings", "--repository-name", REPO, "--image-id", f"imageTag={tag}",
-                check=False)
+
+    def scan_done():
+        found = aws("ecr", "describe-image-scan-findings", "--repository-name", REPO, "--image-id", f"imageTag={tag}",
+                    check=False)
+        status = ((found or {}).get("imageScanStatus") or {}).get("status")
+        return found if status in ("COMPLETE", "FAILED", "UNSUPPORTED_IMAGE") else None
+    found = wait_until(scan_done, "waiting for the scan", minutes=5, every=10)
     status = ((found or {}).get("imageScanStatus") or {}).get("status")
     if status != "COMPLETE":  # the first version reported a scan that never ran as "none" (21/10)
-        say("FAIL", f"scan did not complete (status: {status or 'no scan found'}); don't `create` until it does")
+        say("FAIL", f"scan did not complete (status: {status or 'no scan found after 5 minutes'}); "
+                    "don't `create` or `update` until it does")
         sys.exit(1)
     counts = ((found or {}).get("imageScanFindings") or {}).get("findingSeverityCounts") or {}
     say("OK" if not counts.get("CRITICAL") else "WARN",

@@ -1691,3 +1691,29 @@ Step 6's pipeline will use it.
 
 Logging cost at this volume: the health checks are most of the lines (a few a minute, about 100 bytes each),
 so well under 1 MB a day; ingestion and storage come to pennies a month.
+
+**`push` for commit 1f3c324 (15:58): image pushed, then "FAIL scan did not complete (status: no scan
+found)".** The image was a single manifest this time (no attestation), so not the earlier cause. The helper
+used `aws ecr wait image-scan-complete`, which gives up at once if the scan hasn't been registered yet, and
+asked seconds after the push. Fix: poll the scan findings every 10 s for up to 5 minutes, and let `push` for an
+image already in ECR skip the build and just check its scan (so it can be rerun). Tested against the fake AWS: a
+scan that appears late passes; one that never appears FAILs after 5 minutes. Not committed until after
+`update`, because the image tag is the commit hash.
+
+**On AWS (16:00 to 16:16):**
+- `push` again: SKIP (already in ECR), scan COMPLETE, HIGH 3, MEDIUM 9, LOW 3 (same base image as before, so
+  the same three highs in glibc and zlib).
+- `update`: rolled onto image 1f3c3245f7f0 in about 9 minutes (the canary deployment and the load balancer's
+  health checks); "running image 1f3c3245f7f0, 1 task, /health 200". The URL did not change.
+- `logs`: both log groups (this service's, ending -a3c8, and the first attempt's, ending -be17) now kept 14
+  days. The four marker calls behaved (search answered; over-long query, unknown role, unknown id refused);
+  the search's log line reached CloudWatch within a second; **no log line contains the marker**. Saved query
+  "candidate-rag-mcp/activity" created and run: the refusals appear as "Tool 'get_profile' refused the call
+  (its message is not logged)" and "rejected arguments: ['query']"; the access lines show only the load
+  balancer's private address. (It returned 200 lines, its limit, because the hour included all of today's
+  checks.) The log times are UTC, an hour behind London.
+- `check_http.py --url`: 10 of 10 again on the new image; 10 parallel searches 10/10 in 1.0 s.
+
+**Step 5 status:** everything identified is done. Not exercised: a log line from a real crash (none has
+happened; the unexpected-exception path logs a traceback, which names no caller text in our code but was not
+forced); the stored size, which CloudWatch reports with a delay (0.00 MB so far).
