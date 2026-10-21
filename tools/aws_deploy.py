@@ -84,6 +84,15 @@ def role_arn(name: str) -> str | None:
     return r["Role"]["Arn"] if r else None
 
 
+def service_state() -> str:
+    """ACTIVE, DRAINING, INACTIVE or MISSING, asked by name. list-services stops showing a service as soon as
+    its deletion starts, but the name can't be reused until it has finished draining: on 21/10 `delete`
+    reported it gone and the next `create` failed with "Unable to Start a service that is still Draining"."""
+    r = aws("ecs", "describe-services", "--cluster", CLUSTER, "--services", SERVICE, check=False)
+    services = (r or {}).get("services") or []
+    return services[0].get("status", "MISSING") if services else "MISSING"
+
+
 def find_service() -> dict | None:
     """The Express service's description, or None if it doesn't exist (or is already deleted)."""
     listing = aws("ecs", "list-services", "--cluster", CLUSTER, check=False)
@@ -128,7 +137,7 @@ def cmd_check() -> None:
         ok = len(zones) >= 2
         say("OK" if ok else "FAIL", f"default VPC has {len(public)} public subnets in {len(zones)} zones "
             f"({', '.join(zones)}); Express Mode needs at least 2 zones")
-    for name in POLICIES:
+    for name in (*SERVICE_LINKED_ROLES, *POLICIES):
         say("INFO", f"role {name}: {'exists' if role_arn(name) else 'not created yet'}")
     repo = aws("ecr", "describe-repositories", "--repository-names", REPO, check=False)
     say("INFO", f"ECR repository {REPO}: {'exists' if repo else 'not created yet'}")
@@ -138,7 +147,26 @@ def cmd_check() -> None:
     say("INFO", f"local image candidate-rag-mcp:local: {'present' if local.returncode == 0 else 'missing'}")
 
 
+# AWS's own roles for the three services Express Mode drives. In a new account each is created on first use,
+# and Express Mode then used the load balancer and auto-scaling ones within a second of creating them, before
+# IAM had propagated them (CloudTrail, 21/10, 13:42:47-56 UTC): CreateLoadBalancer "AccessDenied", auto scaling
+# "Unable to assume IAM role", deployment rolled back. Creating them up front avoids that race. All free.
+SERVICE_LINKED_ROLES = {
+    "AWSServiceRoleForECS": "ecs.amazonaws.com",
+    "AWSServiceRoleForElasticLoadBalancing": "elasticloadbalancing.amazonaws.com",
+    "AWSServiceRoleForApplicationAutoScaling_ECSService": "ecs.application-autoscaling.amazonaws.com",
+}
+
+
 def cmd_roles() -> None:
+    # The service-linked roles first (see SERVICE_LINKED_ROLES). The first `create` failed on the ECS one:
+    # "Unable to assume the service linked role. Please verify that the ECS service linked role exists."
+    for name, service in SERVICE_LINKED_ROLES.items():
+        if role_arn(name):
+            say("SKIP", f"{name} already exists")
+        else:
+            aws("iam", "create-service-linked-role", "--aws-service-name", service, region=False)
+            say("OK", f"created {name}")
     for name, (trust, policy) in POLICIES.items():
         if role_arn(name):
             say("SKIP", f"{name} already exists")
@@ -150,7 +178,7 @@ def cmd_roles() -> None:
         attached = aws("iam", "list-attached-role-policies", "--role-name", name, region=False)["AttachedPolicies"]
         names = [p["PolicyName"] for p in attached]
         say("OK" if policy.rsplit("/", 1)[-1] in names else "FAIL", f"{name} policies: {', '.join(names)}")
-    say("INFO", "new roles can take about a minute to be usable; wait before `create` if you just made them")
+    say("INFO", "new roles can take about a minute to be usable; wait at least 2 minutes before `create` if any were just made")
 
 
 def cmd_repo() -> None:
@@ -229,6 +257,12 @@ def cmd_create() -> None:
     if find_service():
         say("SKIP", f"service {SERVICE} already exists; use `status`")
         return
+    if service_state() == "DRAINING":
+        say("INFO", f"the previous {SERVICE} is still draining; waiting for it to finish (often 5 to 10 minutes)")
+        if not wait_until(lambda: service_state() != "DRAINING", "waiting for the drain to finish", minutes=20, every=20):
+            say("FAIL", "still draining after 20 minutes; run `create` again later")
+            sys.exit(1)
+        say("OK", "drain finished")
     tag = git("rev-parse", "--short=12", "HEAD")
     if not aws("ecr", "describe-images", "--repository-name", REPO, "--image-ids", f"imageTag={tag}", check=False):
         say("FAIL", f"no image for the current commit ({tag}) in ECR. Run `push` first.")
@@ -321,8 +355,10 @@ def cmd_delete() -> None:
             say("SKIP", "not deleted")
             return
         aws("ecs", "delete-express-gateway-service", "--service-arn", svc["serviceArn"])
-        say("OK", "delete requested; waiting until it's gone")
-        wait_until(lambda: find_service() is None, "waiting for the service to go", minutes=20)
+        say("OK", "delete requested; waiting until it has fully drained (the charge stops as it goes)")
+        gone = wait_until(lambda: service_state() in ("INACTIVE", "MISSING"), "waiting for the drain to finish",
+                          minutes=20, every=20)
+        say("OK" if gone else "WARN", "service fully deleted" if gone else "still draining after 20 minutes; `create` will wait for it")
     lbs = aws("elbv2", "describe-load-balancers")["LoadBalancers"]
     say("OK" if not lbs else "WARN", f"load balancers left in {REGION}: {len(lbs)}"
         + ("" if not lbs else " (Express Mode removes its own when the last service goes; if one stays, tell me)"))

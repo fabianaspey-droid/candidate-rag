@@ -1544,3 +1544,109 @@ none", which was misleading: a scan that didn't run looked like a clean one.
 it now reads the scan *status*, stops with FAIL unless it is COMPLETE, and only then reports the findings.
 Tested against the fake AWS: a completed scan reports its findings; no scan stops with FAIL. The image
 already in ECR (d33cc2a2cf39, an index) stays until the lifecycle rule removes it; nothing will run it.
+
+**Plain image pushed (14:37):** commit 3c123b2; `push` built with --provenance=false --sbom=false (no
+attestation or manifest-list lines this time), every layer already in ECR, digest sha256:68ad9eab...
+**Scan COMPLETE: HIGH 3, MEDIUM 9, LOW 3, no CRITICAL.** The three HIGH findings, all in the base image's
+Debian packages, none in our code: CVE-2026-19499 (glibc 2.41-12+deb13u4), CVE-2026-85091 (zlib
+1.3.dfsg+really1.3.1-1), CVE-2026-5435 (glibc 2.41-12+deb13u4). Not assessed for exploitability here (no CVE
+details looked up yet). Decision: proceed, under the agreed rule (no CRITICAL); the remedy when Debian ships
+fixed packages is a newer pinned python:3.13-slim digest and a rebuild, a deliberate change rather than an
+unpinned `apt-get upgrade` that would make builds unrepeatable.
+
+**Plain image pushed and scanned (14:37):** commit 3c123b2; image `candidate-rag-mcp:3c123b2ce367`, all layers
+already in ECR, one plain manifest (no "attestation manifest" in the build output this time). **Scan
+COMPLETE: 0 critical, 3 high, 9 medium, 3 low.** The three HIGH findings are all in the Debian base image's
+operating-system packages, not in our code or Python packages: CVE-2026-19499 and CVE-2026-5435 in glibc
+2.41-12+deb13u4, and CVE-2026-85091 in zlib 1.3.dfsg+really1.3.1-1. Not assessed in detail. Decision:
+proceed (the agreed bar was no CRITICAL), and record the follow-up: move to a newer pinned python:3.13-slim
+digest once Debian ships fixed glibc and zlib, rebuild, rescan.
+
+**`create` failed (14:41), nothing created, no charge:** "InvalidParameterException ... Unable to assume the
+service linked role. Please verify that the ECS service linked role exists." This is ECS's own account-wide
+role, AWSServiceRoleForECS, not one of the two roles made in `roles` (those were 12 minutes old, so not a
+propagation delay). AWS's Express Mode getting-started page mentions this error. Normally ECS creates the role
+on first use; in this brand-new account it evidently hadn't. Fix: `roles` now creates it with `aws iam
+create-service-linked-role --aws-service-name ecs.amazonaws.com` if it's missing (free; the role is managed by
+AWS), and `check` reports it. Tested against the fake AWS: created when missing, skipped when present.
+
+**The real cause, from CloudTrail (21/10, 14:51 to 14:54).** `status` showed the service ACTIVE but 0 of 1
+tasks running. Service events: "deployment failed: Service deployment rolled back because PROVISIONING
+lifecycle hook(s) failed. AccessDenied: The infrastructure role ... doesn't have enough permission." No task had
+ever started. CloudTrail (eu-north-1, and us-east-1 for IAM):
+- 13:42:47 UTC: the infrastructure role creates AWSServiceRoleForElasticLoadBalancing, and the same second
+  CreateLoadBalancer is refused ("AccessDenied: An unknown error occurred").
+- 13:42:48: it creates AWSServiceRoleForApplicationAutoScaling_ECSService, and the same second
+  RegisterScalableTarget fails: "Unable to assume IAM role ... AWSServiceRoleForApplicationAutoScaling_ECSService".
+- 13:42:54: retries; both roles "has been taken in this account" (they now exist), still not usable; refused again.
+- 13:42:56: deployment rolled back.
+A first-use race in a brand-new account: AWS's own service-linked roles created on demand and used before IAM
+had propagated them. Also refused, and judged not to be the cause because AWS's own managed policy doesn't
+grant them, so Express Mode must tolerate it: ecs:DescribeServices, ecs:UpdateService, cloudwatch:DescribeAlarms,
+ec2:DescribeAccountAttributes. To revisit if the retry still fails.
+
+**Correction to the earlier entry:** AWSServiceRoleForECS was created at 13:40:21 UTC, by the CLI's own role,
+at the moment of the first `create`. So ECS did create it automatically; that first failure was the same
+propagation race, the "wait and retry" case AWS's getting-started page mentions, not a missing role.
+
+**Fix:** `roles` now creates all three service-linked roles up front (ECS, Elastic Load Balancing, Application
+Auto Scaling for ECS), so a fresh account never races, and says to wait at least 2 minutes before `create`
+if any were just made. `check` lists all three. Tested against the fake AWS: created when missing, skipped
+when present. In this account all three now exist and are about 12 minutes old, so a retry should go through.
+
+**Retry blocked by my helper (14:58):** `delete` reported the service gone and 0 load balancers; `roles`
+skipped all five roles (they exist); `create` then failed: "Unable to Start a service that is still
+Draining." Cause: the helper decided "gone" from list-services, which stops listing a service as soon as its
+deletion starts, while the name stays reserved until the drain finishes. Fabian: "I feel like we're going
+round in circles so let's get this finished please."
+
+**Fix:** a `service_state()` asked by name through describe-services (ACTIVE, DRAINING, INACTIVE or MISSING).
+`delete` now waits until INACTIVE or MISSING; `create` waits out a drain by itself before creating, so one
+command does it. Tested against the fake AWS: create, delete (waits for the drain), and create run
+straight after a delete (waits, then creates). `create` still uses the image already in ECR for commit
+3c123b2, so this change is deliberately not committed until after the service is up.
+
+**It came up (21/10, 15:00 to 15:19).** `create` waited out the drain, created the service from image
+3c123b2ce367, got the URL (a random host under ecs.eu-north-1.on.aws), set MCP_ALLOWED_HOSTS to it, which
+starts a second, rolling deployment, then waited for /health and /mcp. Fabian asked whether it was really
+waiting rather than failing silently as last time; checked from a second window: `status` showed 0 of 1
+tasks and 2 deployments in progress (the first plus the host update), the service events showed "has
+started 1 tasks" at 15:06:15 and "registered 1 targets" at 15:06:55, and there were no stopped tasks. So
+the role race was gone; the wait was the load balancer's 5 healthy checks 30 s apart. `create` finished
+after about 7 to 8 minutes in all.
+
+Against the live URL, from the laptop:
+- `python tools\check_http.py --url https://<host>`: **10 of 10 passed** (in --url mode there is no
+  self-start check, so 10, not 11). /health ok in sample mode; initialize with the right host; another host
+  refused (404); a foreign browser origin 403, claude.ai allowed; stateless tool call; search returns 5
+  ranked results; get_profile; the 21-result guard; 10 searches at once all succeed, 10/10 in 1.4 s, each
+  waiting 0.9 to 1.3 s (the one-at-a-time lock queuing them, as designed).
+- `python tools\inspector_check.py --http https://<host>/mcp`: **12 of 12 passed** (Inspector 2.9.0 over
+  Streamable HTTP): exactly the three read-only tools, --strict clean, the jd://{role} resource, the
+  shortlist_for_role prompt, list_roles in sample mode, search, both guards, get_profile, the advert.
+
+Not yet exercised at this point: the claude.ai custom connector; the task count staying at 1 after the
+burst (not re-read since); a teardown and recreate from the fixed helper end to end (delete was run once,
+before the drain fix); what the spend looks like after a day.
+
+**The claude.ai connector (21/10, 15:40).** Fabian asked about authentication first; kept authless as the
+build guide recommended (sample data that is already public, read-only tools, no paid API, cost capped at
+one task; OAuth would protect nothing and add a sign-in an interviewer doesn't have). He then asked whether
+the test wasn't already covered by the Part 2 integration: no, the desktop app's local server has the same
+tool names, so the test was done in claude.ai, where only the remote server exists. Added as a custom
+connector "candidate-rag (AWS sample)" with the URL ending /mcp, OAuth fields empty. **No sign-in was
+asked for.** The prompt "Use candidate-rag to list the roles, then find the 3 best candidates for
+semi-senior" listed both roles, searched the 20-person semi-senior pool, read the profiles and put forward
+ids 10, 21 and 11 (the same top three as check_http and the Inspector), with 13, 18 and 16 as near misses,
+and said the server is running in sample mode. Separately, from a Claude session in Anthropic's cloud
+(not the laptop), the same connector's list_roles returned mode "sample" and both roles: the server
+answers from outside Fabian's machine.
+
+`status` afterwards: ACTIVE, running tasks 1 of desired 1, 0 deployments in progress, /health 200
+sample mode, /mcp answers. The burst of 10 searches did not add a task.
+
+The live URL is kept out of the repo on purpose (it would invite traffic to an authless endpoint); it is
+given to an interviewer directly.
+
+**Step 4 status:** everything identified is done. Not exercised: a full delete and recreate with the fixed
+helper (delete was run once, before the drain fix); the spend after a day; the CloudWatch logs (Step 5).
